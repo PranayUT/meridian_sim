@@ -119,17 +119,19 @@
       <kingpin_width>0.34</kingpin_width>
       <!-- The plugin derives its tightest turn as wheel_base/sin(steering_limit),
            but the bicycle geometry VehicleModel plans against is
-           wheel_base/tan(steer_max). Feeding the raw 0.70994526 centre angle here
-           yields a 0.445 m radius instead of 0.337 m, so every hard turn came out
-           32% wider than the planner predicted. Pre-compensate with
-           asin(tan(steer_max)) to land on the intended 60 deg inside wheel. -->
-      <steering_limit>1.0341605521</steering_limit>
+           wheel_base/tan(steer_max). Feeding the raw 0.56249793 centre angle here
+           yields a 0.544 m radius instead of 0.460 m, so hard turns come out
+           wider than the planner predicted. Pre-compensate with
+           asin(tan(steer_max)) to land on the intended 45 deg inside wheel. -->
+      <steering_limit>0.6821131963</steering_limit>
       <wheel_base>0.29</wheel_base><wheel_separation>0.34</wheel_separation><wheel_radius>0.10</wheel_radius>
       <topic>/model/hill_rover/cmd_vel</topic><odom_topic>/model/hill_rover/odometry</odom_topic>
       <frame_id>odom</frame_id><child_frame_id>base_link</child_frame_id><odom_publish_frequency>50</odom_publish_frequency>
       <steer_p_gain>8.0</steer_p_gain>
       <!-- Gazebo applies this one limiter to BOTH linear and angular commands, so
-           size it for the 4.3 rad/s peak yaw demand rather than for linear speed.
+           size it for the peak yaw demand rather than for linear speed. The
+           45 deg steering limit puts that peak at 3.7 rad/s (down from 4.3), so
+           this window keeps margin rather than truncating hard turns.
            Symmetry keeps negative-yaw steering from being clamped to zero; the
            wider magnitude keeps hard turns from being truncated at 2.2 rad/s.
            Neither costs anything on the linear axis: MPPI clips its own speed

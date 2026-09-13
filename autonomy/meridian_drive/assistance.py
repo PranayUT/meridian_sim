@@ -8,6 +8,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from .maps import MapFormatError, MapStack, load_uav_map
 
@@ -21,24 +22,57 @@ class AssistanceManager:
     request_path: Path
     status_path: Path
     map_stack: MapStack
+    uncertainty_threshold: float = 0.20
+    map_size_m: float = 25.0
+    request_handler: Callable[[tuple[float, float, float, float], int], None] | None = None
+    persistence_s: float = 2.0
+    stop_speed_mps: float = 0.08
+    stop_settle_s: float = 0.5
+    fusion_settle_s: float = 1.0
 
     def __post_init__(self) -> None:
         if self.mode not in MODES:
             raise ValueError(f"assistance mode must be one of {', '.join(MODES)}")
+        if not 0.0 <= self.uncertainty_threshold <= 1.0:
+            raise ValueError("uncertainty threshold must be between 0 and 1")
+        if self.map_size_m <= 0.0:
+            raise ValueError("UAV map size must be positive")
+        if min(self.persistence_s, self.stop_speed_mps, self.stop_settle_s, self.fusion_settle_s) < 0.0:
+            raise ValueError("assistance timing and stop speed must be non-negative")
         self.state = "driving"
         self.detail = f"{self.mode} policy is active"
         self._map_mtime_ns = -1
         self._request_id = ""
         self._request_count = 0
-        self._region_counts: dict[tuple[int, int], int] = {}
-        self._region_key: tuple[int, int] | None = None
+        self._request_history: list[dict[str, object]] = []
+        self._request_history_path = self.request_path.with_name(
+            f"{self.request_path.stem}_history.json"
+        )
+        self._region_counts: dict[tuple[str, str, int, int], int] = {}
+        self._region_key: tuple[str, str, int, int] | None = None
         self._last_request_s = 0.0
         self._last_status_s = 0.0
-        self.reload_map()
+        self._high_since: dict[str, float] = {}
+        self._stopped_since: float | None = None
+        self._fusion_started_s = 0.0
+        self._pending_roi: tuple[float, float, float, float] | None = None
+        self._pending_source = ""
+        self._pending_map_type = ""
+        self._pending_exposure = 0.0
+        self._pending_decision_relevant = False
+        # Meridian Drive excludes aerial evidence older than the active trial.
+        # Remember any pre-existing file so only a later atomic replacement is
+        # admitted, whether this run uses the simulator or an external source.
+        self.map_stack.aerial = None
+        if self.mode != "ground_only":
+            try:
+                self._map_mtime_ns = self.map_path.stat().st_mtime_ns
+            except FileNotFoundError:
+                pass
 
     @property
     def hold(self) -> bool:
-        return self.mode == "counterfactual_uav" and self.state in {"waiting", "exhausted"}
+        return self.mode == "counterfactual_uav" and self.state != "driving"
 
     def reload_map(self) -> bool:
         # Ground-only trials must remain ground-only even if a UAV result from
@@ -60,28 +94,93 @@ class AssistanceManager:
         self.map_stack.aerial = candidate
         self._map_mtime_ns = stat.st_mtime_ns
         if self.state == "waiting":
-            self.state = "driving"
-            self.detail = f"UAV map sequence {candidate.sequence} entered the planner"
+            self.state = "fusing"
+            self._fusion_started_s = time.monotonic()
+            self.detail = f"UAV map sequence {candidate.sequence} is entering the planner"
         else:
             self.detail = f"UAV map sequence {candidate.sequence} loaded"
         return True
 
-    def update(self, exposure: float, roi: tuple[float, float, float, float] | None) -> None:
+    def update(
+        self,
+        exposure: float,
+        roi: tuple[float, float, float, float] | None,
+        *,
+        source: str = "",
+        map_type: str = "",
+        decision_relevant: bool = False,
+        speed_mps: float = 0.0,
+    ) -> None:
         if self.reload_map():
             # The exposure came from the prior map. Let the next planner cycle
             # evaluate the new evidence before it can request another result.
             return
         now = time.monotonic()
-        should_request = exposure >= 0.10 and roi is not None
+        if self.state == "fusing":
+            if now - self._fusion_started_s >= self.fusion_settle_s:
+                self.state = "driving"
+                self.detail = "aerial evidence entered the planner; ground autonomy resumed"
+            else:
+                self._write_status(exposure)
+                return
+
+        if self.state == "stopping":
+            if abs(speed_mps) <= self.stop_speed_mps:
+                if self._stopped_since is None:
+                    self._stopped_since = now
+                if now - self._stopped_since >= self.stop_settle_s:
+                    assert self._pending_roi is not None
+                    self.state = "requesting"
+                    self._write_request(
+                        self._pending_roi,
+                        self._pending_exposure,
+                        hold=True,
+                        source=self._pending_source,
+                        map_type=self._pending_map_type,
+                        decision_relevant=self._pending_decision_relevant,
+                    )
+                    self.state = "waiting"
+            else:
+                self._stopped_since = None
+            self._write_status(exposure)
+            return
+
+        should_request = (
+            (decision_relevant or exposure >= self.uncertainty_threshold)
+            and roi is not None
+            and bool(source)
+        )
+        # The full Meridian evaluator clears persistence independently for
+        # every source on every snapshot. This compact interface emits the
+        # selected source, so a source switch must retire the prior timer.
+        for prior_source in tuple(self._high_since):
+            if prior_source != source:
+                self._high_since.pop(prior_source, None)
+        if should_request:
+            self._high_since.setdefault(source, now)
+        else:
+            self._high_since.pop(source, None)
+        persistent = should_request and now - self._high_since[source] >= self.persistence_s
+        if self.state == "exhausted" and not should_request:
+            self.state = "driving"
+            self._region_key = None
+            self.detail = "uncertainty cleared; ground autonomy resumed"
         if self.mode == "ground_only":
             if should_request:
-                self.detail = f"uncertainty exposure {exposure:.2f} recorded"
+                self.detail = f"{source} uncertainty exposure {exposure:.2f} recorded"
         elif self.mode == "greedy_uav":
-            if should_request and now - self._last_request_s >= 10.0:
-                self._write_request(roi, exposure, hold=False)
-        elif should_request:
+            if persistent and now - self._last_request_s >= 10.0:
+                self._write_request(
+                    roi,
+                    exposure,
+                    hold=False,
+                    source=source,
+                    map_type=map_type,
+                    decision_relevant=decision_relevant,
+                )
+        elif persistent:
             assert roi is not None
-            key = self._key(roi)
+            key = self._key(roi, source, map_type)
             if self.state == "exhausted" and key != self._region_key:
                 self.state = "driving"
             if self.state == "driving" and now - self._last_request_s >= 2.0:
@@ -90,18 +189,30 @@ class AssistanceManager:
                     self.state = "exhausted"
                     self.detail = "two UAV maps did not clear this region"
                 else:
-                    self.state = "waiting"
+                    self.state = "stopping"
                     self._region_key = key
                     self._region_counts[key] = count + 1
-                    if count:
-                        x0, y0, x1, y1 = roi
-                        roi = (x0 - 3.0, y0 - 3.0, x1 + 3.0, y1 + 3.0)
-                    self._write_request(roi, exposure, hold=True)
+                    self._pending_roi = roi
+                    self._pending_source = source
+                    self._pending_map_type = map_type
+                    self._pending_exposure = exposure
+                    self._pending_decision_relevant = decision_relevant
+                    self._stopped_since = None
+                    self.detail = "uncertainty crossed the rollout threshold; stopping to ask for help"
         if now - self._last_status_s >= 0.5:
             self._write_status(exposure)
             self._last_status_s = now
 
-    def _write_request(self, roi: tuple[float, float, float, float], exposure: float, hold: bool) -> None:
+    def _write_request(
+        self,
+        roi: tuple[float, float, float, float],
+        exposure: float,
+        hold: bool,
+        source: str,
+        map_type: str,
+        decision_relevant: bool = False,
+    ) -> None:
+        roi = self._fixed_roi(roi)
         self._request_id = uuid.uuid4().hex
         self._request_count += 1
         self._last_request_s = time.monotonic()
@@ -111,14 +222,32 @@ class AssistanceManager:
             "request_id": self._request_id,
             "request_number": self._request_count,
             "frame": "world",
-            "map_types": ["semantic_traversability", "canopy_obstacle", "canopy_height"],
+            "source": source,
+            "map_types": [map_type],
             "roi_xy": [[x0, y1], [x1, y1], [x1, y0], [x0, y0]],
             "uncertainty_exposure": exposure,
+            "decision_relevant": decision_relevant,
             "hold_requested": hold,
             "result_path": str(self.map_path),
             "created_unix_s": time.time(),
         }
         self._atomic_json(self.request_path, payload)
+        self._request_history.append(payload)
+        self._atomic_json(
+            self._request_history_path,
+            {"version": 1, "requests": self._request_history},
+        )
+        print(
+            f"UAV request {self._request_count}: {source} exposure "
+            f"{exposure:.3f} at ROI ({x0:.2f}, {y0:.2f})-({x1:.2f}, {y1:.2f})",
+            flush=True,
+        )
+        if self.request_handler is not None:
+            try:
+                self.request_handler(roi, self._request_count)
+            except Exception as error:
+                self.detail = f"simulated UAV failed: {error}"
+                return
         action = "Holding for" if hold else "Requested"
         self.detail = f"{action} UAV map {self._request_id}"
 
@@ -131,6 +260,8 @@ class AssistanceManager:
             "hold_requested": self.hold,
             "request_id": self._request_id,
             "request_count": self._request_count,
+            "uncertainty_threshold": self.uncertainty_threshold,
+            "map_size_m": self.map_size_m,
             "uncertainty_exposure": exposure,
             "map_loaded": aerial is not None,
             "map_sequence": aerial.sequence if aerial is not None else None,
@@ -140,9 +271,25 @@ class AssistanceManager:
         self._atomic_json(self.status_path, payload)
 
     @staticmethod
-    def _key(roi: tuple[float, float, float, float]) -> tuple[int, int]:
+    def _key(
+        roi: tuple[float, float, float, float], source: str, map_type: str
+    ) -> tuple[str, str, int, int]:
         x0, y0, x1, y1 = roi
-        return (round((x0 + x1) / 10.0), round((y0 + y1) / 10.0))
+        return (
+            source,
+            map_type,
+            round((x0 + x1) / 10.0),
+            round((y0 + y1) / 10.0),
+        )
+
+    def _fixed_roi(
+        self, roi: tuple[float, float, float, float]
+    ) -> tuple[float, float, float, float]:
+        x0, y0, x1, y1 = roi
+        center_x = (x0 + x1) / 2.0
+        center_y = (y0 + y1) / 2.0
+        half = self.map_size_m / 2.0
+        return center_x - half, center_y - half, center_x + half, center_y + half
 
     @staticmethod
     def _atomic_json(path: Path, payload: dict[str, object]) -> None:

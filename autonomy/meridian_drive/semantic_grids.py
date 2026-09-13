@@ -110,12 +110,26 @@ class SemanticEvidenceGrid:
     def render_with_probabilities(
         self, center_xy: np.ndarray, width: int, height: int, now: float
     ):
-        """Render cost and uncertainty while retaining the class posterior."""
+        """Render viewer layers while retaining the class posterior."""
+        return self.render_layers(center_xy, width, height, now)[:5]
+
+    def render_layers(
+        self, center_xy: np.ndarray, width: int, height: int, now: float
+    ):
+        """Render viewer layers and Meridian's semantic-cost variance.
+
+        The entropy/weak-evidence/age maximum is useful for inspecting map
+        quality, but it is not the Gaussian cost variance consumed by
+        Meridian Drive's assistance policy.  Keep both products explicit so
+        a perfect simulator label is not treated as uncertain merely because
+        it has only been seen once.
+        """
         origin, probabilities, _, support, age = self.render_evidence(
             center_xy, width, height, now
         )
         cost = np.full((height, width), np.nan, dtype=np.float32)
         uncertainty = np.full_like(cost, np.nan)
+        cost_variance = np.full_like(cost, np.nan)
         observed = (support > 0.0).astype(np.float32)
 
         known = support > 0.0
@@ -127,9 +141,15 @@ class SemanticEvidenceGrid:
             )
             weak = np.exp(-support[known] / max(self.weak_evidence_scale, 1e-6))
             age_u = 1.0 - 2.0 ** (-age[known] / max(self.age_half_life, 1e-6))
-            cost[known] = p @ self.class_costs
+            mean_cost = p @ self.class_costs
+            second_moment = p @ np.square(self.class_costs)
+            cost[known] = mean_cost
             uncertainty[known] = np.maximum.reduce((entropy, weak, age_u))
-        return origin, cost, uncertainty, observed, probabilities
+            cost_variance[known] = np.maximum(
+                0.0,
+                second_moment - np.square(mean_cost),
+            ) / (support[known] + 1.0)
+        return origin, cost, uncertainty, observed, probabilities, cost_variance
 
     def render_evidence(
         self, center_xy: np.ndarray, width: int, height: int, now: float

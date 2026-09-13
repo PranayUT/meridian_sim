@@ -14,18 +14,29 @@ from autonomy.meridian_drive.assistance import AssistanceManager
 from autonomy.meridian_drive.core import MPPI, MppiConfig, Route, VehicleModel, rollout
 from autonomy.meridian_drive.ground_mapping import SemanticMapper
 from autonomy.meridian_drive.maps import LocalGridMap, MapStack, TerrainMap, load_uav_map
-from autonomy.meridian_drive.obstacle_grid_logic import SOLID, TALL, classify, rasterize_window
+from autonomy.meridian_drive.obstacle_grid_logic import (
+    GROUND,
+    SOLID,
+    TALL,
+    UNSEEN,
+    ProbabilisticOccupancyGrid,
+    classify,
+    rasterize_window,
+)
 from autonomy.meridian_drive.routes import load_route
+from autonomy.meridian_drive.uav_ground_truth import GroundTruthUav, LabeledEllipse
 from tools.run_experiment import drag_target
+from tools.vegetation import Plant
 
 
 class DynamicsTests(unittest.TestCase):
-    def test_ackermann_inside_wheel_is_limited_to_60_degrees(self) -> None:
+    def test_ackermann_inside_wheel_is_limited_to_45_degrees(self) -> None:
         model = VehicleModel()
         track_width = 0.34
         center_radius = model.wheelbase / math.tan(model.steer_max)
         inside_angle = math.atan(model.wheelbase / (center_radius - track_width / 2.0))
-        self.assertAlmostEqual(math.degrees(inside_angle), 60.0, places=6)
+        self.assertAlmostEqual(math.degrees(inside_angle), 45.0, places=6)
+        self.assertAlmostEqual(center_radius, 0.46, places=6)
 
     def test_straight_velocity_command_moves_forward(self) -> None:
         controls = np.zeros((1, 20, 2), dtype=np.float64)
@@ -175,8 +186,100 @@ class ClassifierTests(unittest.TestCase):
         self.assertIn(TALL, cls)
         self.assertNotIn(SOLID, cls, "a body the rays saw straight through read as solid")
 
+    def test_simulator_confidence_clears_direct_rays_but_not_tall(self) -> None:
+        grid = ProbabilisticOccupancyGrid(
+            res=0.25, window_m=1.0, observation_confidence=3.0
+        )
+        classes = np.full((4, 4), UNSEEN, dtype=np.int8)
+        classes[0, 0] = GROUND
+        classes[0, 1] = TALL
+        grid.update(classes, classes != UNSEEN, 1.0)
+
+        probability, variance, support, _ = grid.evidence_grid(1.0)
+        self.assertLess(float(probability[0, 0]), 0.20)
+        self.assertLess(float(variance[0, 0]), 0.04)
+        self.assertGreaterEqual(float(probability[0, 1]), 0.20)
+        self.assertLessEqual(float(probability[0, 1]), 0.80)
+        self.assertEqual(float(support[0, 0]), 3.0)
+        # Structural classification still sees only one actual sweep.
+        self.assertNotEqual(int(grid.classes()[0, 1]), SOLID)
+
 
 class MapTests(unittest.TestCase):
+    def test_ground_uncertainty_drives_rollout_exposure_and_uav_overrides_it(self) -> None:
+        variance = np.full((4, 4), 0.25, dtype=np.float32)
+        stack = MapStack(
+            ground_occupancy_uncertainty=LocalGridMap(variance, 0.0, 0.0, 1.0)
+        )
+        trajectories = np.asarray([[[0.5, 0.5], [1.5, 0.5], [2.5, 0.5], [3.5, 0.5]]])
+        exposure, roi = stack.uncertainty_exposure(trajectories)
+        self.assertEqual(exposure, 1.0)
+        self.assertIsNotNone(roi)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "map.npz"
+            np.savez_compressed(
+                path,
+                cost=np.zeros((4, 4), dtype=np.float32),
+                obstacle=np.zeros((4, 4), dtype=np.float32),
+                uncertainty=np.zeros((4, 4), dtype=np.float32),
+                origin_xy=np.asarray((0.0, 0.0)),
+                resolution=np.asarray(1.0),
+            )
+            stack.aerial = load_uav_map(path)
+        exposure, roi = stack.uncertainty_exposure(trajectories)
+        self.assertEqual(exposure, 0.0)
+        self.assertIsNone(roi)
+
+    def test_cell_maturity_does_not_transfer_across_moving_frontier(self) -> None:
+        variance = np.full((2, 8), 0.25, dtype=np.float32)
+        stack = MapStack(
+            ground_occupancy_uncertainty=LocalGridMap(
+                variance, 0.0, 0.0, 1.0
+            ),
+            uncertainty_maturity_s=1.0,
+        )
+        first = np.asarray([[[0.5, 0.5], [1.5, 0.5]]])
+        replacement = np.asarray([[[4.5, 0.5], [5.5, 0.5]]])
+
+        initial = stack.evaluate_assistance(first, None, 0.2, now_s=10.0)
+        almost = stack.evaluate_assistance(first, None, 0.2, now_s=10.9)
+        mature = stack.evaluate_assistance(first, None, 0.2, now_s=11.0)
+        replaced = stack.evaluate_assistance(
+            replacement, None, 0.2, now_s=11.1
+        )
+
+        self.assertEqual(initial.uncertainty_exposure, 0.0)
+        self.assertEqual(almost.uncertainty_exposure, 0.0)
+        self.assertEqual(mature.uncertainty_exposure, 1.0)
+        self.assertEqual(replaced.uncertainty_exposure, 0.0)
+
+    def test_counterfactual_does_not_resolve_immature_frontier(self) -> None:
+        probability = np.full((4, 8), np.nan, dtype=np.float32)
+        variance = np.full_like(probability, np.nan)
+        stack = MapStack(
+            ground_obstacle_probability=LocalGridMap(
+                probability, 0.0, 0.0, 1.0
+            ),
+            ground_occupancy_uncertainty=LocalGridMap(
+                variance, 0.0, 0.0, 1.0
+            ),
+            uncertainty_maturity_s=1.0,
+        )
+        trajectories = np.asarray(
+            [[[0.5, 0.5], [1.5, 0.5], [2.5, 0.5], [3.5, 0.5]]]
+        )
+        immature = stack.evaluate_assistance(
+            trajectories, (0.0, 0.0), 0.2, now_s=1.0
+        )
+        mature = stack.evaluate_assistance(
+            trajectories, (0.0, 0.0), 0.2, now_s=2.0
+        )
+        self.assertFalse(immature.decision_relevant)
+        self.assertIsNone(immature.roi)
+        self.assertTrue(mature.decision_relevant)
+        self.assertIsNotNone(mature.roi)
+
     def test_meridian_ground_classes_reach_planner_cost(self) -> None:
         grid = np.asarray([[0, 50, 100]], dtype=np.int8)
         stack = MapStack(ground_obstacles=LocalGridMap(grid, 0.0, 0.0, 1.0))
@@ -206,10 +309,31 @@ class MapTests(unittest.TestCase):
         mapper.set_labels(labels, 1.0)
         mapper.set_depth(depth, 1.0)
         self.assertTrue(mapper.project_if_ready((0.0, 0.0, 0.0, 0.0), 1.0))
-        _, cost, _, observed, obstacle = mapper.render((0.0, 0.0), 1.0)
+        _, cost, _, observed, obstacle, cost_variance = mapper.render_layers(
+            (0.0, 0.0), 1.0
+        )
         self.assertEqual(np.count_nonzero(observed), 1)
         self.assertAlmostEqual(float(cost[np.isfinite(cost)][0]), 0.70, places=5)
         self.assertAlmostEqual(float(obstacle[np.isfinite(obstacle)][0]), 1.0)
+        self.assertAlmostEqual(
+            float(cost_variance[np.isfinite(cost_variance)][0]), 0.0, places=7
+        )
+
+    def test_semantic_assistance_uses_cost_variance_not_weak_support(self) -> None:
+        mapper = SemanticMapper()
+        probabilities = np.zeros((1, 64), dtype=np.float64)
+        probabilities[0, 17] = 0.5
+        probabilities[0, 31] = 0.5
+        mapper.grid.update(
+            np.asarray([[0.1, 0.1]]), probabilities, np.ones(1), 1.0
+        )
+        _, _, viewer_uncertainty, observed, _, cost_variance = (
+            mapper.render_layers((0.0, 0.0), 1.0)
+        )
+        cell = observed > 0.0
+        self.assertGreater(float(viewer_uncertainty[cell][0]), 0.8)
+        expected = ((0.7**2 + 0.2**2) / 2.0 - 0.45**2) / 2.0
+        self.assertAlmostEqual(float(cost_variance[cell][0]), expected, places=7)
 
     def test_semantic_obstacle_probability_is_a_planner_collision(self) -> None:
         cost_grid = np.asarray([[0.2, 0.6, 0.4]], dtype=np.float32)
@@ -290,11 +414,35 @@ class MapTests(unittest.TestCase):
                 root / "request.json",
                 root / "status.json",
                 MapStack(),
+                persistence_s=0.0,
+                stop_settle_s=0.0,
+                fusion_settle_s=0.0,
             )
-            manager.update(1.0, (0.0, 0.0, 5.0, 5.0))
+            manager.update(
+                1.0,
+                (0.0, 0.0, 5.0, 5.0),
+                source="lidar_occupancy",
+                map_type="canopy_obstacle",
+            )
             self.assertTrue(manager.hold)
+            manager.update(
+                1.0,
+                (0.0, 0.0, 5.0, 5.0),
+                source="lidar_occupancy",
+                map_type="canopy_obstacle",
+                speed_mps=0.0,
+            )
             request = json.loads((root / "request.json").read_text())
+            history = json.loads((root / "request_history.json").read_text())
             self.assertTrue(request["hold_requested"])
+            self.assertEqual(len(history["requests"]), 1)
+            self.assertEqual(history["requests"][0]["source"], "lidar_occupancy")
+            self.assertFalse(history["requests"][0]["decision_relevant"])
+            self.assertEqual(request["map_types"], ["canopy_obstacle"])
+            xs = [point[0] for point in request["roi_xy"]]
+            ys = [point[1] for point in request["roi_xy"]]
+            self.assertAlmostEqual(max(xs) - min(xs), 25.0)
+            self.assertAlmostEqual(max(ys) - min(ys), 25.0)
             np.savez_compressed(
                 map_path,
                 cost=np.zeros((10, 10), dtype=np.float32),
@@ -305,8 +453,34 @@ class MapTests(unittest.TestCase):
                 sequence=np.asarray(1),
             )
             manager.update(0.0, None)
+            manager.update(0.0, None)
             self.assertFalse(manager.hold)
             self.assertEqual(manager.map_stack.aerial.sequence, 1)
+
+    def test_ground_truth_uav_writes_occupancy_and_goose_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "uav.npz"
+            producer = GroundTruthUav(
+                path,
+                [
+                    Plant("grass", -2.0, 0.0, 0.0, 1.0, 0.0),
+                    Plant("bush", 0.0, 0.0, 0.0, 1.0, 0.0),
+                    Plant("tree", 2.0, 0.0, 0.0, 1.0, 0.0),
+                ],
+                [LabeledEllipse(0.0, 2.0, 0.8, 0.5, 0.0, 40)],
+            )
+            producer((-12.5, -12.5, 12.5, 12.5), 3)
+            with np.load(path, allow_pickle=False) as archive:
+                self.assertEqual(archive["occupancy"].shape, (100, 100))
+                self.assertEqual(archive["semantic_label"].shape, (100, 100))
+                self.assertIn(17, archive["semantic_label"])
+                self.assertIn(28, archive["semantic_label"])
+                self.assertIn(40, archive["semantic_label"])
+                self.assertIn(50, archive["semantic_label"])
+                self.assertGreater(np.count_nonzero(archive["occupancy"]), 0)
+                self.assertEqual(int(archive["sequence"]), 3)
+            layer = load_uav_map(path)
+            self.assertEqual(layer.shape, (100, 100))
 
     def test_ground_only_never_loads_a_stale_uav_map(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

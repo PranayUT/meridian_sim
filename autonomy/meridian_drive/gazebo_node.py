@@ -23,6 +23,7 @@ from .core import MPPI, MppiConfig, Route
 from .ground_mapping import GroundMapper, SemanticMapper, write_snapshot
 from .maps import LocalGridMap, MapStack, TerrainMap
 from .routes import find_default_route, load_route
+from .uav_ground_truth import GroundTruthUav
 from .visualization import GazeboMarkers
 
 DEFAULT_ROUTE = [(0.0, 0.0), (12.0, 0.0), (18.0, 12.0), (5.0, 20.0), (-8.0, 8.0)]
@@ -46,24 +47,41 @@ class GazeboAutonomy:
         )
         self.planner = MPPI(self.route, config=config, seed=args.seed)
         terrain = TerrainMap.from_tif(args.terrain_dem) if args.terrain_dem else None
-        self.map_stack = MapStack(terrain=terrain)
+        self.map_stack = MapStack(
+            terrain=terrain,
+            uncertainty_maturity_s=args.mapping_uncertainty_maturity,
+        )
         self.ground_mapper = GroundMapper()
         self.semantic_mapper = SemanticMapper()
         self.ground_map_path = args.ground_map
         self.last_map_write_s = 0.0
         self.latest_ground_obstacles: LocalGridMap | None = None
         self.latest_ground_obstacle_probability: LocalGridMap | None = None
+        self.latest_ground_occupancy_uncertainty: LocalGridMap | None = None
         self.latest_ground_semantics: LocalGridMap | None = None
         self.latest_ground_semantic_obstacles: LocalGridMap | None = None
+        self.latest_ground_semantic_uncertainty: LocalGridMap | None = None
         self.markers = None if args.no_visualization else GazeboMarkers(
             self.node, terrain, args.marker_service
         )
+        ground_truth_uav = None
+        if args.assistance != "ground_only" and args.uav_source == "ground_truth":
+            ground_truth_uav = GroundTruthUav.from_world(
+                args.uav_map,
+                args.uav_semantic_masks,
+                args.world_file,
+                args.uav_vegetation_seed,
+                args.uav_resolution,
+            )
         self.assistance = AssistanceManager(
             mode=args.assistance,
             map_path=args.uav_map,
             request_path=args.uav_request,
             status_path=args.status,
             map_stack=self.map_stack,
+            uncertainty_threshold=args.uav_uncertainty_threshold,
+            map_size_m=args.uav_map_size,
+            request_handler=ground_truth_uav,
         )
         self.arrival_radius = args.arrival_radius
         self.lock = threading.Lock()
@@ -227,11 +245,14 @@ class GazeboAutonomy:
                 self.latest_ground_obstacles = LocalGridMap(
                     self.ground_mapper.classes.copy(), origin[0], origin[1], 0.25
                 )
-                occupancy_probability = self.ground_mapper.occupancy.evidence_grid(
-                    scan_s
-                )[0]
+                occupancy_probability, occupancy_variance = (
+                    self.ground_mapper.occupancy.evidence_grid(scan_s)[:2]
+                )
                 self.latest_ground_obstacle_probability = LocalGridMap(
                     occupancy_probability, origin[0], origin[1], 0.25
+                )
+                self.latest_ground_occupancy_uncertainty = LocalGridMap(
+                    occupancy_variance, origin[0], origin[1], 0.25
                 )
                 last_lidar_s = now_s
 
@@ -245,14 +266,22 @@ class GazeboAutonomy:
                     (pose[0], pose[1], pose[2], base_z), now_s
                 )
                 if semantic_changed:
-                    origin, cost, _, _, obstacle = self.semantic_mapper.render(
-                        pose[:2], now_s
-                    )
+                    (
+                        origin,
+                        cost,
+                        _,
+                        _,
+                        obstacle,
+                        cost_variance,
+                    ) = self.semantic_mapper.render_layers(pose[:2], now_s)
                     self.latest_ground_semantics = LocalGridMap(
                         cost, float(origin[0]), float(origin[1]), 0.25
                     )
                     self.latest_ground_semantic_obstacles = LocalGridMap(
                         obstacle, float(origin[0]), float(origin[1]), 0.25
+                    )
+                    self.latest_ground_semantic_uncertainty = LocalGridMap(
+                        cost_variance, float(origin[0]), float(origin[1]), 0.25
                     )
                     last_semantic_s = now_s
 
@@ -283,9 +312,15 @@ class GazeboAutonomy:
         self.map_stack.ground_obstacle_probability = (
             self.latest_ground_obstacle_probability
         )
+        self.map_stack.ground_occupancy_uncertainty = (
+            self.latest_ground_occupancy_uncertainty
+        )
         self.map_stack.ground_semantics = self.latest_ground_semantics
         self.map_stack.ground_semantic_obstacles = (
             self.latest_ground_semantic_obstacles
+        )
+        self.map_stack.ground_semantic_uncertainty = (
+            self.latest_ground_semantic_uncertainty
         )
         if math.hypot(x - self.route.xy[-1, 0], y - self.route.xy[-1, 1]) <= self.arrival_radius:
             if not self.arrived:
@@ -304,8 +339,20 @@ class GazeboAutonomy:
             self.markers.update(self.route.xy, self.route_anchors, self.planner.best_trajectory())
         trajectories = self.planner.last_trajectories
         planned = trajectories[:, 1:] if trajectories is not None else trajectories
-        exposure, roi = self.map_stack.uncertainty_exposure(planned)
-        self.assistance.update(exposure, roi)
+        evaluation = self.map_stack.evaluate_assistance(
+            planned,
+            (x, y),
+            self.assistance.uncertainty_threshold,
+            self.now(),
+        )
+        self.assistance.update(
+            evaluation.uncertainty_exposure,
+            evaluation.roi,
+            source=evaluation.source,
+            map_type=evaluation.map_type,
+            decision_relevant=evaluation.decision_relevant,
+            speed_mps=speed,
+        )
         if self.assistance.hold:
             command[:] = 0.0
 
@@ -418,6 +465,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--assistance", choices=MODES, default="ground_only")
     parser.add_argument("--uav-map", type=Path, default=runtime / "uav_map.npz")
     parser.add_argument("--uav-request", type=Path, default=runtime / "uav_request.json")
+    parser.add_argument(
+        "--uav-source", choices=("ground_truth", "file"), default="ground_truth",
+        help="generate exact simulator maps or wait for an external NPZ producer",
+    )
+    parser.add_argument("--uav-uncertainty-threshold", type=float, default=0.20)
+    parser.add_argument(
+        "--mapping-uncertainty-maturity", type=float, default=1.0,
+        help="seconds one unresolved swept cell must persist before exposure",
+    )
+    parser.add_argument("--uav-map-size", type=float, default=25.0)
+    parser.add_argument("--uav-resolution", type=float, default=0.25)
+    parser.add_argument(
+        "--uav-vegetation-seed", type=int,
+        help="seed used to bake Gazebo vegetation; defaults to the paint file seed",
+    )
+    parser.add_argument(
+        "--uav-semantic-masks", type=Path,
+        default=project_root / "maps" / "vegetation_paint.npz",
+    )
+    parser.add_argument(
+        "--world-file", type=Path,
+        default=project_root / "worlds" / "hill_country.sdf",
+    )
     parser.add_argument("--status", type=Path, default=runtime / "autonomy_status.json")
     parser.add_argument("--samples", type=int, default=128)
     parser.add_argument("--horizon", type=int, default=60)
@@ -449,6 +519,20 @@ def parse_args() -> argparse.Namespace:
         parser.error("samples must be at least 8 and horizon must be at least 2")
     if args.target_speed <= 0.0 or args.speed_max < args.target_speed:
         parser.error("speed limits must be positive and speed-max must include target-speed")
+    if not 0.0 <= args.uav_uncertainty_threshold <= 1.0:
+        parser.error("uav-uncertainty-threshold must be between 0 and 1")
+    if args.mapping_uncertainty_maturity < 0.0:
+        parser.error("mapping-uncertainty-maturity must be non-negative")
+    if args.uav_map_size <= 0.0 or args.uav_resolution <= 0.0:
+        parser.error("uav-map-size and uav-resolution must be positive")
+    cells = args.uav_map_size / args.uav_resolution
+    if not math.isclose(cells, round(cells), abs_tol=1e-9):
+        parser.error("uav-map-size must be an integer multiple of uav-resolution")
+    if args.assistance != "ground_only" and args.uav_source == "ground_truth":
+        if not args.uav_semantic_masks.is_file():
+            parser.error(f"simulated UAV semantic masks do not exist: {args.uav_semantic_masks}")
+        if not args.world_file.is_file():
+            parser.error(f"simulator world does not exist: {args.world_file}")
     return args
 
 

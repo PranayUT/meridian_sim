@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -114,6 +114,17 @@ class UavMap:
         uncertainty = np.where(covered, self.uncertainty_grid[safe_row, safe_col], 1.0)
         valid = covered & np.isfinite(cost) & np.isfinite(obstacle) & np.isfinite(uncertainty)
         return cost, obstacle, uncertainty, valid
+
+
+@dataclass(frozen=True)
+class AssistanceEvaluation:
+    """One Meridian-style source selected from a frozen rollout population."""
+
+    uncertainty_exposure: float
+    roi: tuple[float, float, float, float] | None
+    source: str = ""
+    map_type: str = ""
+    decision_relevant: bool = False
 
 
 def _scalar(archive: object, key: str) -> object:
@@ -250,10 +261,31 @@ class MapStack:
     terrain: TerrainMap | None = None
     ground_obstacles: LocalGridMap | None = None
     ground_obstacle_probability: LocalGridMap | None = None
+    ground_occupancy_uncertainty: LocalGridMap | None = None
     ground_semantics: LocalGridMap | None = None
     ground_semantic_obstacles: LocalGridMap | None = None
+    ground_semantic_uncertainty: LocalGridMap | None = None
     collision_probability: float = 0.65
     semantic_collision_probability: float = 0.45
+    uncertainty_maturity_s: float = 1.0
+    _uncertain_since: dict[str, dict[tuple[int, int], float]] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _maturity_update_s: dict[str, float] = field(
+        default_factory=dict, init=False, repr=False
+    )
+
+    _FOOTPRINT_OFFSETS = (
+        (0.0, 0.0),
+        (-0.225, 0.0),
+        (0.225, 0.0),
+        (0.0, -0.225),
+        (0.0, 0.225),
+        (-0.16, -0.16),
+        (-0.16, 0.16),
+        (0.16, -0.16),
+        (0.16, 0.16),
+    )
 
     def cost(self, x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         total_cost = np.zeros_like(x)
@@ -266,17 +298,7 @@ class MapStack:
         # footprint. Semantic labels retain a traversability cost, while the
         # posterior mass of brush, tree, and rock labels is a physical
         # collision signal in this simulator.
-        for dx, dy in (
-            (0.0, 0.0),
-            (-0.225, 0.0),
-            (0.225, 0.0),
-            (0.0, -0.225),
-            (0.0, 0.225),
-            (-0.16, -0.16),
-            (-0.16, 0.16),
-            (0.16, -0.16),
-            (0.16, 0.16),
-        ):
+        for dx, dy in self._FOOTPRINT_OFFSETS:
             sample_x, sample_y = x + dx, y + dy
             if self.ground_semantics is not None:
                 semantic, valid = self.ground_semantics.sample(sample_x, sample_y)
@@ -322,26 +344,255 @@ class MapStack:
     def uncertainty_exposure(
         self, trajectories: np.ndarray | None
     ) -> tuple[float, tuple[float, float, float, float] | None]:
-        """Measure how much of the sampled rollout population needs evidence."""
+        """Compatibility view of :meth:`evaluate_assistance`."""
+        evaluation = self.evaluate_assistance(trajectories, None, 0.0)
+        return evaluation.uncertainty_exposure, evaluation.roi
+
+    def evaluate_assistance(
+        self,
+        trajectories: np.ndarray | None,
+        initial_xy: tuple[float, float] | None,
+        exposure_threshold: float,
+        now_s: float | None = None,
+    ) -> AssistanceEvaluation:
+        """Evaluate occupancy and semantic evidence as Meridian Drive does.
+
+        Each channel reports the fraction of swept-footprint cells above its
+        uncertainty rule. Occupancy additionally receives the free/occupied
+        counterfactual test. Aerial evidence supersedes ground evidence only
+        inside the returned map footprint.
+        """
         if trajectories is None or len(trajectories) == 0:
-            return 0.0, None
-        x, y = trajectories[..., 0], trajectories[..., 1]
-        if self.aerial is None:
-            uncertain = np.ones(x.shape, dtype=bool)
-        else:
-            _, _, variance, valid = self.aerial.sample(x, y)
-            uncertain = (~valid) | (variance >= 0.04)
-        if uncertain.ndim == 1:
-            exposure = float(np.mean(uncertain))
-        else:
-            exposure = float(np.mean(np.any(uncertain, axis=1)))
-        if not np.any(uncertain):
-            return exposure, None
-        selected_x, selected_y = x[uncertain], y[uncertain]
-        padding = 4.0
-        return exposure, (
-            float(np.min(selected_x) - padding),
-            float(np.min(selected_y) - padding),
-            float(np.max(selected_x) + padding),
-            float(np.max(selected_y) + padding),
+            return AssistanceEvaluation(0.0, None)
+        candidates: list[AssistanceEvaluation] = []
+        occupancy = self._occupancy_evaluation(trajectories, initial_xy, now_s)
+        if occupancy is not None:
+            candidates.append(occupancy)
+        semantic = self._evidence_exposure(
+            trajectories,
+            self.ground_semantic_uncertainty,
+            source="ground_semantic_cost",
+            map_type="semantic_traversability",
+            uncertainty_min=0.04,
+            now_s=now_s,
+        )
+        if semantic is not None:
+            candidates.append(semantic)
+        if not candidates:
+            return AssistanceEvaluation(0.0, None)
+        relevant = next((item for item in candidates if item.decision_relevant), None)
+        if relevant is not None:
+            return relevant
+        # Meridian evaluates the control occupancy source first, then the
+        # remaining evidence topics in configured order. Preserve that stable
+        # priority instead of letting small score noise switch sources.
+        selected = next(
+            (
+                item
+                for item in candidates
+                if item.uncertainty_exposure >= exposure_threshold
+            ),
+            None,
+        )
+        if selected is not None:
+            return selected
+        highest = max(candidates, key=lambda item: item.uncertainty_exposure)
+        return AssistanceEvaluation(highest.uncertainty_exposure, None)
+
+    def _evidence_exposure(
+        self,
+        trajectories: np.ndarray,
+        layer: LocalGridMap | None,
+        source: str,
+        map_type: str,
+        uncertainty_min: float,
+        probability_layer: LocalGridMap | None = None,
+        now_s: float | None = None,
+    ) -> AssistanceEvaluation | None:
+        if layer is None:
+            return None
+        x, y = self._swept_points(trajectories)
+        x = x.reshape(-1)
+        y = y.reshape(-1)
+        uncertainty, valid = layer.sample(x, y)
+        uncertain = valid & ((~np.isfinite(uncertainty)) | (uncertainty >= uncertainty_min))
+        if probability_layer is not None:
+            probability, probability_valid = probability_layer.sample(x, y)
+            known_probability = probability_valid & np.isfinite(probability)
+            uncertain |= valid & (
+                (~known_probability) | ((probability >= 0.20) & (probability <= 0.80))
+            )
+        if self.aerial is not None:
+            _, _, aerial_uncertainty, aerial_valid = self.aerial.sample(x, y)
+            uncertain = np.where(
+                aerial_valid,
+                aerial_uncertainty >= uncertainty_min,
+                uncertain,
+            )
+            valid |= aerial_valid
+        if not np.any(valid):
+            return None
+        # Meridian counts distinct swept cells, not repeated trajectory visits.
+        cell_x = np.floor(x[valid] / layer.resolution).astype(np.int64)
+        cell_y = np.floor(y[valid] / layer.resolution).astype(np.int64)
+        cells = np.column_stack((cell_x, cell_y, uncertain[valid].astype(np.int8)))
+        coordinates, inverse = np.unique(cells[:, :2], axis=0, return_inverse=True)
+        raw_flags = np.zeros(len(coordinates), dtype=bool)
+        np.logical_or.at(raw_flags, inverse, cells[:, 2].astype(bool))
+        flags = self._mature_uncertainty(source, coordinates, raw_flags, now_s)
+        exposure = float(np.mean(flags))
+        if not np.any(flags):
+            return AssistanceEvaluation(exposure, None, source, map_type)
+        selected = coordinates[flags].astype(np.float64) * layer.resolution
+        return AssistanceEvaluation(
+            exposure,
+            (
+                float(np.min(selected[:, 0])),
+                float(np.min(selected[:, 1])),
+                float(np.max(selected[:, 0]) + layer.resolution),
+                float(np.max(selected[:, 1]) + layer.resolution),
+            ),
+            source,
+            map_type,
+        )
+
+    def _occupancy_evaluation(
+        self,
+        trajectories: np.ndarray,
+        initial_xy: tuple[float, float] | None,
+        now_s: float | None,
+    ) -> AssistanceEvaluation | None:
+        exposure = self._evidence_exposure(
+            trajectories,
+            self.ground_occupancy_uncertainty,
+            source="lidar_occupancy",
+            map_type="canopy_obstacle",
+            uncertainty_min=0.04,
+            probability_layer=self.ground_obstacle_probability,
+            now_s=now_s,
+        )
+        if exposure is None or initial_xy is None or self.ground_obstacle_probability is None:
+            return exposure
+        states_x = trajectories[..., 0]
+        states_y = trajectories[..., 1]
+        probabilities: list[np.ndarray] = []
+        uncertain_samples: list[np.ndarray] = []
+        for dx, dy in self._FOOTPRINT_OFFSETS:
+            x, y = states_x + dx, states_y + dy
+            probability, probability_valid = self.ground_obstacle_probability.sample(x, y)
+            variance, variance_valid = self.ground_occupancy_uncertainty.sample(x, y)
+            known = probability_valid & variance_valid & np.isfinite(probability) & np.isfinite(variance)
+            probability = np.where(known, probability, 0.5)
+            uncertain = (~known) | (variance >= 0.04) | (
+                (probability >= 0.20) & (probability <= 0.80)
+            )
+            if self.aerial is not None:
+                _, aerial_probability, aerial_uncertainty, aerial_valid = self.aerial.sample(x, y)
+                probability = np.where(aerial_valid, aerial_probability, probability)
+                uncertain = np.where(aerial_valid, aerial_uncertainty >= 0.04, uncertain)
+            uncertain = self._mature_sample_uncertainty(
+                exposure.source,
+                x,
+                y,
+                uncertain,
+                self.ground_occupancy_uncertainty.resolution,
+                now_s,
+            )
+            probabilities.append(probability)
+            uncertain_samples.append(uncertain)
+        probability = np.maximum.reduce(probabilities)
+        uncertain = np.logical_or.reduce(uncertain_samples)
+        baseline_max = np.max(probability, axis=-1)
+        free_max = np.max(np.where(uncertain, 0.05, probability), axis=-1)
+        occupied_max = np.max(np.where(uncertain, 0.95, probability), axis=-1)
+        progress = np.hypot(
+            states_x[..., -1] - initial_xy[0],
+            states_y[..., -1] - initial_xy[1],
+        )
+        useful = np.isfinite(progress) & (progress >= 0.25)
+        baseline_viability = float(np.mean(useful & (baseline_max < 0.50)))
+        free_viability = float(np.mean(useful & (free_max < 0.50)))
+        occupied_viability = float(np.mean(useful & (occupied_max < 0.50)))
+        decision_relevant = (
+            np.any(uncertain)
+            and baseline_viability < 0.20
+            and max(free_viability, occupied_viability) - baseline_viability >= 0.15
+            and abs(free_viability - occupied_viability) >= 0.15
+        )
+        return AssistanceEvaluation(
+            exposure.uncertainty_exposure,
+            exposure.roi,
+            exposure.source,
+            exposure.map_type,
+            decision_relevant,
+        )
+
+    def _mature_uncertainty(
+        self,
+        source: str,
+        coordinates: np.ndarray,
+        uncertain: np.ndarray,
+        now_s: float | None,
+    ) -> np.ndarray:
+        """Require the same unresolved cells to persist in the swept set.
+
+        Meridian's policy already persists a source-level exposure.  This
+        source-side gate prevents different newly encountered frontier cells
+        from satisfying that timer on one another's behalf.  Calls without a
+        clock retain the immediate behavior used by compatibility callers.
+        """
+        if now_s is None or self.uncertainty_maturity_s <= 0.0:
+            return uncertain
+        now_s = float(now_s)
+        previous_update = self._maturity_update_s.get(source)
+        if previous_update is not None and now_s < previous_update:
+            self._uncertain_since.pop(source, None)
+        self._maturity_update_s[source] = now_s
+
+        history = self._uncertain_since.setdefault(source, {})
+        current: dict[tuple[int, int], float] = {}
+        mature = np.zeros_like(uncertain)
+        for index in np.flatnonzero(uncertain):
+            key = (int(coordinates[index, 0]), int(coordinates[index, 1]))
+            since = history.get(key, now_s)
+            current[key] = since
+            mature[index] = now_s - since >= self.uncertainty_maturity_s
+        # Dropping a cell from the current rollout population resets its
+        # opportunity window. This is what distinguishes a moving frontier
+        # from one location that remains unresolved under repeated planning.
+        self._uncertain_since[source] = current
+        return mature
+
+    def _mature_sample_uncertainty(
+        self,
+        source: str,
+        x: np.ndarray,
+        y: np.ndarray,
+        uncertain: np.ndarray,
+        resolution: float,
+        now_s: float | None,
+    ) -> np.ndarray:
+        """Apply the exposure maturity state to counterfactual samples too."""
+        if now_s is None or self.uncertainty_maturity_s <= 0.0:
+            return uncertain
+        history = self._uncertain_since.get(source, {})
+        cell_x = np.floor(x / resolution).astype(np.int64).reshape(-1)
+        cell_y = np.floor(y / resolution).astype(np.int64).reshape(-1)
+        raw = uncertain.reshape(-1)
+        mature = np.zeros_like(raw)
+        now_s = float(now_s)
+        for index in np.flatnonzero(raw):
+            since = history.get((int(cell_x[index]), int(cell_y[index])))
+            mature[index] = (
+                since is not None
+                and now_s - since >= self.uncertainty_maturity_s
+            )
+        return mature.reshape(uncertain.shape)
+
+    def _swept_points(self, trajectories: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        x = trajectories[..., 0]
+        y = trajectories[..., 1]
+        return (
+            np.concatenate([x + dx for dx, _ in self._FOOTPRINT_OFFSETS]),
+            np.concatenate([y + dy for _, dy in self._FOOTPRINT_OFFSETS]),
         )

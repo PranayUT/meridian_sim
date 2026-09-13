@@ -85,12 +85,15 @@ Since this is not a git repo, copy the directory. Three things to get right:
   Nothing fails and nothing warns — you would simply be driving a different
   world, and results would not be comparable with anything measured here.
   Checksum it on both ends before trusting a batch.
-- **`maps/` (1.5 GB) is optional.** It is the DEM and vegetation-paint source,
-  needed only to re-crop the terrain or re-paint vegetation. An experiment box
-  does not need it. `runtime/` is disposable output; exclude it too.
+- **Most of `maps/` is optional, but `maps/vegetation_paint.npz` is required
+  for the ground-truth UAV surrogate.** The larger DEM sources are needed only
+  to re-crop terrain or re-paint vegetation. A ground-only experiment box can
+  omit all of `maps/`; an air-ground experiment box must retain the small
+  vegetation paint NPZ. `runtime/` is disposable output; exclude it.
 
 ```bash
-rsync -a --exclude runtime/ --exclude maps/ --exclude '__pycache__' \
+rsync -a --exclude runtime/ --include 'maps/vegetation_paint.npz' \
+  --exclude 'maps/*' --exclude '__pycache__' \
   teaming_sim/ user@big-machine:~/teaming_sim/          # ~180 MB
 
 # same terrain on both ends, or the results are not comparable

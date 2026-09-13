@@ -21,9 +21,12 @@ class VehicleModel:
     """The velocity-command bicycle model used by Meridian Drive MPPI."""
 
     wheelbase: float = 0.29
-    # A 60 degree limit at the inside physical wheel corresponds to this
-    # virtual center-wheel angle for the rover's Ackermann geometry.
-    steer_max: float = 0.7099452630375517
+    # A 45 degree limit at the inside physical wheel corresponds to this
+    # virtual center-wheel angle for the rover's Ackermann geometry, a 0.460 m
+    # centre turn radius. The earlier 60 degree limit (0.7099452630375517, a
+    # 0.337 m radius) cranked the wheels far enough to scrub on loose ground,
+    # which cost yaw response rather than buying it.
+    steer_max: float = 0.5624979310690724
     steer_tau: float = 0.131
     velocity_tau: float = 0.12
     acceleration_max: float = 2.46
@@ -65,9 +68,12 @@ class MppiConfig:
     steering_rate_weight: float = 1.0
     # Final backstop on the published wheel angle, from Meridian's
     # steer_cmd_slew_rad_s. Without it a one-cycle steering jump slams the
-    # wheels to a new angle and the rover oscillates; 1.5 rad/s allows
-    # 0.075 rad per 50 ms tick.
-    steer_cmd_slew_rad_s: float = 1.5
+    # wheels to a new angle and the rover oscillates; 3.0 rad/s allows
+    # 0.15 rad per 50 ms tick, so straight-to-full-lock takes 0.19 s instead of
+    # the 0.47 s the previous 1.5 rad/s bound imposed. The Gazebo steering
+    # joints (6 rad/s) and the plugin's yaw ramp (0.176 s) can both track this,
+    # so the slew is no longer the binding constraint on turn-in.
+    steer_cmd_slew_rad_s: float = 3.0
     map_cost_weight: float = 3.0
     obstacle_cost: float = 80.0
     collision_cost: float = 1_000_000.0

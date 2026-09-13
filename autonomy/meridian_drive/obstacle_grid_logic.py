@@ -1324,6 +1324,7 @@ class ProbabilisticOccupancyGrid:
         occupied_log_odds: float = 0.85,
         tall_log_odds: float = 0.35,
         free_log_odds: float = -0.85,
+        observation_confidence: float = 1.0,
         decay_half_life_s: float = 5.0,
         evidence_cap: float = 10.0,
         observed_evidence_min: float = 0.5,
@@ -1341,6 +1342,7 @@ class ProbabilisticOccupancyGrid:
         positive = (
             occupied_log_odds,
             tall_log_odds,
+            observation_confidence,
             decay_half_life_s,
             evidence_cap,
             observed_evidence_min,
@@ -1375,6 +1377,7 @@ class ProbabilisticOccupancyGrid:
         self.occupied_log_odds = float(occupied_log_odds)
         self.tall_log_odds = float(tall_log_odds)
         self.free_log_odds = float(free_log_odds)
+        self.observation_confidence = float(observation_confidence)
         self.decay_half_life_s = float(decay_half_life_s)
         self.evidence_cap = float(evidence_cap)
         self.observed_evidence_min = float(observed_evidence_min)
@@ -1529,8 +1532,17 @@ class ProbabilisticOccupancyGrid:
     def evidence_grid(
         self, now_s: float
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Return Bernoulli mean, posterior variance, support, and age."""
-        probability = self.probability()
+        """Return calibrated Bernoulli mean, variance, support, and age.
+
+        ``observation_confidence`` lets a deterministic simulator observation
+        carry more assistance confidence without weakening the independent
+        scan count used by :meth:`classes` for persistent SOLID structure.
+        Field behavior is unchanged at the default scale of one.
+        """
+        scaled_log_odds = self.log_odds * self.observation_confidence
+        probability = (
+            1.0 / (1.0 + np.exp(-scaled_log_odds))
+        ).astype(np.float32)
         known = self.evidence >= self.observed_evidence_min
         mean = np.full(probability.shape, np.nan, dtype=np.float32)
         variance = np.full(probability.shape, np.nan, dtype=np.float32)
@@ -1538,10 +1550,10 @@ class ProbabilisticOccupancyGrid:
         variance[known] = (
             probability[known]
             * (1.0 - probability[known])
-            / (self.evidence[known] + 1.0)
+            / (self.evidence[known] * self.observation_confidence + 1.0)
         )
         support = np.zeros(probability.shape, dtype=np.float32)
-        support[known] = self.evidence[known]
+        support[known] = self.evidence[known] * self.observation_confidence
         age = np.full(probability.shape, np.nan, dtype=np.float32)
         observed = known & np.isfinite(self.last_observed_s)
         age[observed] = np.maximum(

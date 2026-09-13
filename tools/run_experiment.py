@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the ground-only route campaign and record outcomes per trial.
+"""Run route campaigns with ground-only or simulated-UAV assistance.
 
 Each trial drives one route in one direction with one seed. When the rover
 stops making progress the harness drags it along the route and counts that as
@@ -277,7 +277,12 @@ def run_trial(
     command = [
         sys.executable, "-m", "autonomy.meridian_drive.gazebo_node",
         "--route-file", str(trial.route_file),
-        "--assistance", "ground_only",
+        "--assistance", args.assistance,
+        "--uav-source", args.uav_source,
+        "--uav-uncertainty-threshold", str(args.uav_uncertainty_threshold),
+        "--mapping-uncertainty-maturity", str(args.mapping_uncertainty_maturity),
+        "--uav-map-size", str(args.uav_map_size),
+        "--uav-map", str(args.run_dir / "uav_map.npz"),
         "--seed", str(trial.seed),
         "--arrival-radius", str(args.arrival_radius),
         "--ground-map", str(args.run_dir / "ground_maps.npz"),
@@ -285,6 +290,8 @@ def run_trial(
         "--uav-request", str(args.run_dir / "uav_request.json"),
         "--no-visualization",
     ]
+    if trial.veg_seed:
+        command.extend(("--uav-vegetation-seed", str(int(trial.veg_seed))))
     log_path = args.run_dir / f"node_c{trial.cycle}_{trial.route}_{trial.direction}.log"
     goal = anchors[-1]
     wall_start = time.monotonic()
@@ -365,6 +372,12 @@ def run_trial(
                 node.wait(timeout=5.0)
 
     sim_s, _, _, _, path_m = watcher.snapshot()
+    uav_requests = 0
+    status_path = args.run_dir / "autonomy_status.json"
+    try:
+        uav_requests = int(json.loads(status_path.read_text(encoding="utf-8"))["request_count"])
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        pass
     return {
         "cycle": trial.cycle,
         "seed": trial.seed,
@@ -378,6 +391,10 @@ def run_trial(
         "route_length_m": round(trial.route_length_m, 2),
         "interventions": interventions,
         "interventions_resolved": resolved,
+        "uav_requests": uav_requests,
+        "assistance": args.assistance,
+        "uav_uncertainty_threshold": args.uav_uncertainty_threshold,
+        "mapping_uncertainty_maturity": args.mapping_uncertainty_maturity,
         "veg_seed": trial.veg_seed,
     }
 
@@ -390,6 +407,15 @@ def main() -> int:
                         default=["forward", "reverse"],
                         help="run a subset so long routes can be split across sittings")
     parser.add_argument("--seed", type=int, default=7, help="seed of the first cycle")
+    parser.add_argument(
+        "--assistance",
+        choices=("ground_only", "greedy_uav", "counterfactual_uav"),
+        default="ground_only",
+    )
+    parser.add_argument("--uav-source", choices=("ground_truth", "file"), default="ground_truth")
+    parser.add_argument("--uav-uncertainty-threshold", type=float, default=0.20)
+    parser.add_argument("--mapping-uncertainty-maturity", type=float, default=1.0)
+    parser.add_argument("--uav-map-size", type=float, default=25.0)
     parser.add_argument("--stuck-s", type=float, default=30.0, help="sim seconds without progress")
     parser.add_argument("--stuck-epsilon", type=float, default=0.5, help="m that counts as progress")
     parser.add_argument("--drag-m", type=float, default=3.0)
@@ -408,6 +434,10 @@ def main() -> int:
     parser.add_argument("--run-id", default=None,
                         help="names runtime/experiments/<id>/; defaults to a timestamp")
     args = parser.parse_args()
+    if not 0.0 <= args.uav_uncertainty_threshold <= 1.0:
+        parser.error("uav-uncertainty-threshold must be between 0 and 1")
+    if args.mapping_uncertainty_maturity < 0.0:
+        parser.error("mapping-uncertainty-maturity must be non-negative")
 
     # Everything a run writes lives under one directory so several campaigns
     # can share a machine. Pair that with a distinct GZ_PARTITION per run.
@@ -444,7 +474,9 @@ def main() -> int:
     results_path.parent.mkdir(parents=True, exist_ok=True)
     columns = ["cycle", "seed", "route", "direction", "outcome", "success",
                "sim_time_s", "wall_time_s", "path_length_m", "route_length_m",
-               "interventions", "interventions_resolved", "veg_seed"]
+               "interventions", "interventions_resolved", "uav_requests",
+               "assistance", "uav_uncertainty_threshold",
+               "mapping_uncertainty_maturity", "veg_seed"]
     rows: list[dict] = []
     stop = False
 
@@ -474,7 +506,8 @@ def main() -> int:
                 handle_file.flush()
                 print(
                     f"    {row['outcome']}: {row['sim_time_s']:.0f}s sim, "
-                    f"{row['path_length_m']:.0f} m driven, {row['interventions']} drags",
+                    f"{row['path_length_m']:.0f} m driven, {row['interventions']} drags, "
+                    f"{row['uav_requests']} UAV requests",
                     flush=True,
                 )
             cycle += 1

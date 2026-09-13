@@ -148,12 +148,22 @@ Select one of the Meridian Drive experiment policies when autonomy starts:
 ./scripts/run_autonomy.sh --assistance counterfactual_uav
 ```
 
-The default exchange directory is `runtime/`. Autonomy writes the current map
-request atomically to `runtime/uav_request.json`. The request has a world-frame
-`roi_xy` polygon, requested products, uncertainty exposure, and a
-`hold_requested` value. Your map process must write its result atomically to
-`runtime/uav_map.npz`. Write a temporary file in the same directory and rename
-it into place so autonomy never reads a partial archive.
+The UAV modes default to `--uav-source ground_truth`. This is the experiment
+surrogate: after a counterfactual request, autonomy constructs an exact 25 m by
+25 m local map centered on the selected uncertainty region. Its occupancy is
+rasterized from the seeded Gazebo bush/tree bodies and fixed rocks. Its
+semantic layer uses the same GOOSE IDs as the ground camera (`31` soil, `50`
+grass, `17` brush, `28` tree, and `40` rock). The result is written atomically
+to `runtime/uav_map.npz`; `occupancy` and `semantic_label` retain the two raw
+ground-truth products, while `obstacle`, `cost`, and `uncertainty` are their
+planner-ready forms.
+
+Autonomy also writes the request atomically to `runtime/uav_request.json`. It
+contains the selected source, matching requested product, world-frame
+`roi_xy`, uncertainty exposure, and `hold_requested`. Use `--uav-source file`
+to disable the simulator producer and attach an external map process. That
+process must write a temporary NPZ in the same directory and rename it into
+place so autonomy never reads a partial archive.
 
 The small simulator NPZ contract is:
 
@@ -166,6 +176,9 @@ The small simulator NPZ contract is:
 | `resolution` | float | Square cell size in metres. |
 | `sequence` | integer | Producer sequence for status and experiment records. |
 
+Ground-truth simulator results additionally contain `occupancy` (H×W uint8,
+0 or 100) and `semantic_label` (H×W uint8 GOOSE ID).
+
 Row zero is the south edge. Columns increase toward positive X. Rows increase
 toward positive Y. The loader also accepts the existing Meridian Drive UAV NPZ
 contract when its frame is `world`, `map`, or `odom`, or its CRS is `local`,
@@ -173,12 +186,45 @@ contract when its frame is `world`, `map`, or `odom`, or its CRS is `local`,
 by the map generator before upload. The autonomy status is written to
 `runtime/autonomy_status.json`.
 
-`ground_only` records uncertainty and never requests help. `greedy_uav`
-requests maps while it continues to drive. `counterfactual_uav` publishes a
-zero command after a selected rollout crosses uncertain space. It resumes when
-a new valid NPZ replaces the prior result. It permits two requests for one
-5 m region. The second request expands the region by 3 m on each side. It holds
-for operator action if the second result does not clear the uncertainty.
+The uncertainty path follows Meridian Drive's counterfactual boundary. It
+evaluates occupancy and semantic evidence separately over the swept rollout
+footprints. Occupancy cells are uncertain at variance 0.04 or ambiguous
+probability 0.20–0.80. Semantic assistance uses Meridian's posterior traversal-
+cost variance with a 0.04 cutoff; the entropy/support/age composite remains a
+viewer diagnostic only. Deterministic Gazebo occupancy observations carry
+three effective observations for assistance confidence without weakening the
+repeated-sweep requirement for a physical `SOLID` classification.
+`--uav-uncertainty-threshold` controls the fraction of touched cells that must
+be uncertain and defaults to 0.20. Crossings must persist for 2 seconds. A
+higher value reduces requests only when exposure falls between the two values;
+fully unknown rollout footprints score 1.0 and therefore remain triggers.
+Before entering that source-level persistence timer, the same unresolved swept
+cells must remain relevant for `--mapping-uncertainty-maturity` seconds
+(default 1.0); newly encountered frontier cells cannot inherit one another's
+age.
+
+`ground_only` records the same signal and never requests help. `greedy_uav`
+requests without holding. `counterfactual_uav` also applies the occupancy
+free-versus-occupied viability test, makes a smooth stop, confirms the rover is
+settled, requests the source selected by the rollout evaluation, admits the
+new map, waits for fusion settling, and resumes. As in Meridian Drive, it
+permits two requests for one 5 m region and source, then holds for operator
+action. Unlike the field policy's expanding retry, every simulator response
+remains exactly 25 m by 25 m.
+
+For example, run Route 11 at the 20% starting point and inspect its request
+count and channel scores before changing the policy:
+
+```bash
+./scripts/run_experiment.sh --routes Route-11 --directions forward \
+  --cycles 1 --assistance counterfactual_uav \
+  --uav-uncertainty-threshold 0.20
+```
+
+`runtime/autonomy_status.json` and the campaign CSV both record the request
+count and threshold. Every request is also retained in
+`runtime/uav_request_history.json`, including its selected source, ROI, and
+exposure at the trigger.
 
 The native stack intentionally leaves out ROS, hardware drivers, GNSS
 localization, and the field deadman. Gazebo's world-pose stream supplies
@@ -186,9 +232,9 @@ simulation ground-truth position and heading; wheel odometry supplies speed.
 The planner keeps Meridian Drive's velocity-command bicycle model, receding
 horizon sampling, route costs, obstacle costs, and UAV assistance modes. The
 Gazebo rover uses physical front-wheel Ackermann steering with the same 0.29 m
-wheelbase and limits the inside front wheel to 60 degrees. The corresponding
-virtual bicycle angle is 40.7 degrees because the two front wheels follow
-different radii. The transport boundary converts that bicycle angle to the
+wheelbase and limits the inside front wheel to 45 degrees. The corresponding
+virtual bicycle angle is 32.2 degrees because the two front wheels follow
+different radii, giving a 0.460 m tightest centre turn radius. The transport boundary converts that bicycle angle to the
 yaw-rate command accepted by Gazebo's Ackermann plugin and enforces the same
 lateral-acceleration limit as the planner rollout.
 Gazebo's Ackermann plugin applies one speed limiter to both its linear and its
@@ -198,7 +244,7 @@ is sized for yaw and the linear envelope is enforced on the published command in
 commands, so the symmetric velocity window costs nothing on that axis. The
 plugin also derives its tightest turn as `wheel_base/sin(steering_limit)` rather
 than the bicycle model's `wheel_base/tan(steer_max)`, so `steering_limit` carries
-an `asin(tan(...))` pre-compensation to reach the intended 0.337 m radius.
+an `asin(tan(...))` pre-compensation to reach the intended 0.460 m radius.
 
 ## Headless operation
 
@@ -232,8 +278,9 @@ costs 1-2 late cycles per 100, and 5x misses about 40 per 100. Lower
 ## Route experiments
 
 `scripts/run_experiment.sh` drives a campaign and records one CSV row per
-trial. It runs each named route forward and reversed, cycling the seed, with
-ground-only assistance:
+trial. It runs each named route forward and reversed, cycling the seed. The
+default is ground-only assistance; pass `--assistance counterfactual_uav` for
+the request-driven ground-truth UAV condition:
 
 ```bash
 ./scripts/run_experiment.sh --cycles 5 --rtf 3
@@ -250,10 +297,11 @@ from the harness, not from `gazebo_node`, so the planner under test stays the
 same code that runs against Meridian Drive.
 
 Recorded per trial: outcome, success, simulator seconds, wall seconds, distance
-driven, route length, interventions, and how many of those interventions the
-rover actually drove clear of. Dividing simulator by wall seconds gives the
-speed-up the run really achieved, which is the number to trust when tuning
-`--rtf` on new hardware.
+driven, route length, interventions, how many of those interventions the rover
+actually drove clear of, assistance mode, uncertainty threshold, cell-maturity
+window, and UAV request count. Dividing simulator by wall seconds gives the speed-up the run
+really achieved, which is the number to trust when tuning `--rtf` on new
+hardware.
 
 Everything a run writes goes to `runtime/experiments/<run-id>/`: the campaign
 CSV, one autonomy log per trial, the Gazebo log, and that run's ground map and

@@ -47,7 +47,12 @@ class GroundMapper:
 
     def __init__(self) -> None:
         self.local = LocalGrid(RESOLUTION, WINDOW_M, history=10, ground_history=100)
-        self.occupancy = ProbabilisticOccupancyGrid(RESOLUTION, WINDOW_M)
+        # Gazebo ray returns are deterministic ground truth. Count each as
+        # three effective observations for assistance confidence, while the
+        # filter's structural SOLID decision still requires repeated sweeps.
+        self.occupancy = ProbabilisticOccupancyGrid(
+            RESOLUTION, WINDOW_M, observation_confidence=3.0
+        )
         self.classes = np.full((GRID_CELLS, GRID_CELLS), UNSEEN, dtype=np.int8)
 
     def update(
@@ -185,14 +190,31 @@ class SemanticMapper:
         return True
 
     def render(self, center_xy: tuple[float, float], now_s: float):
-        origin, cost, uncertainty, observed, probabilities = self.grid.render_with_probabilities(
+        return self.render_layers(center_xy, now_s)[:5]
+
+    def render_layers(self, center_xy: tuple[float, float], now_s: float):
+        (
+            origin,
+            cost,
+            uncertainty,
+            observed,
+            probabilities,
+            cost_variance,
+        ) = self.grid.render_layers(
             np.asarray(center_xy), GRID_CELLS, GRID_CELLS, now_s
         )
         obstacle_probability = np.nansum(
             probabilities[..., SEMANTIC_OBSTACLE_LABELS], axis=2
         ).astype(np.float32)
         obstacle_probability[observed <= 0.0] = np.nan
-        return origin, cost, uncertainty, observed, obstacle_probability
+        return (
+            origin,
+            cost,
+            uncertainty,
+            observed,
+            obstacle_probability,
+            cost_variance,
+        )
 
 
 def write_snapshot(
@@ -216,7 +238,8 @@ def write_snapshot(
         semantic_uncertainty,
         semantic_observed,
         semantic_obstacle_probability,
-    ) = semantic.render(pose[:2], stamp_s)
+        semantic_cost_variance,
+    ) = semantic.render_layers(pose[:2], stamp_s)
     # A process-specific temporary name keeps a stale or accidentally doubled
     # autonomy process from stealing this writer's file between save and rename.
     temp = path.with_name(f".{path.name}.{os.getpid()}.tmp.npz")
@@ -231,6 +254,7 @@ def write_snapshot(
             occupancy_origin=np.asarray(occupancy.origin),
             semantic_cost=semantic_cost,
             semantic_uncertainty=semantic_uncertainty,
+            semantic_cost_variance=semantic_cost_variance,
             semantic_observed=semantic_observed,
             semantic_obstacle_probability=semantic_obstacle_probability,
             semantic_origin=np.asarray(origin),

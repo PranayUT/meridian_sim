@@ -28,6 +28,9 @@ SEED=7
 CAMPAIGN=""
 ROUTES=(Route-11 Route-12 Route-13)
 DIRECTIONS=(forward reverse)
+ASSISTANCE="ground_only"
+UAV_THRESHOLD="0.20"
+MAPPING_MATURITY="1.0"
 
 usage() {
   cat <<'USAGE'
@@ -39,6 +42,9 @@ Usage: scripts/run_campaign.sh [options]
   --seed S         first round's seed; round r uses S + r (default 7)
   --routes "A B"   routes from paths/from_truck (default Route-11 Route-12 Route-13)
   --directions "forward reverse"
+  --assistance MODE  ground_only, greedy_uav, or counterfactual_uav
+  --uav-threshold X request when uncertain rollout exposure reaches X (default .20)
+  --mapping-maturity X  seconds one swept cell must remain uncertain (default 1.0)
   --campaign NAME  run-id prefix and summary filter (default a timestamp)
 USAGE
 }
@@ -52,6 +58,9 @@ while (($# > 0)); do
     --campaign) CAMPAIGN="$2"; shift 2 ;;
     --routes) read -ra ROUTES <<<"$2"; shift 2 ;;
     --directions) read -ra DIRECTIONS <<<"$2"; shift 2 ;;
+    --assistance) ASSISTANCE="$2"; shift 2 ;;
+    --uav-threshold) UAV_THRESHOLD="$2"; shift 2 ;;
+    --mapping-maturity) MAPPING_MATURITY="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -67,6 +76,13 @@ if [[ ! "${SEED}" =~ ^[0-9]+$ ]]; then
   echo "--seed needs a non-negative integer" >&2
   exit 2
 fi
+case "${ASSISTANCE}" in
+  ground_only|greedy_uav|counterfactual_uav) ;;
+  *)
+    echo "--assistance must be ground_only, greedy_uav, or counterfactual_uav" >&2
+    exit 2
+    ;;
+esac
 CAMPAIGN="${CAMPAIGN:-$(date +%Y%m%d_%H%M%S)}"
 if [[ ! "${CAMPAIGN}" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "--campaign may only contain letters, digits, dot, dash, and underscore" >&2
@@ -104,6 +120,8 @@ run_trial() {
       --run-id "${run_id}" --rtf "${RTF}" --veg-root "${veg_root}" \
       --routes "${route}" --directions "${direction}" \
       --cycles 1 --seed "${seed}" --veg-seed "${seed}" \
+      --assistance "${ASSISTANCE}" --uav-uncertainty-threshold "${UAV_THRESHOLD}" \
+      --mapping-uncertainty-maturity "${MAPPING_MATURITY}" \
       >"${run_dir}/campaign.log" 2>&1; then
     echo "$(date +%H:%M:%S) done  ${run_id}"
   else
