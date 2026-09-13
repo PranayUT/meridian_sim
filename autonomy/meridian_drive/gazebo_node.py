@@ -21,7 +21,7 @@ from gz.transport13 import Node
 from .assistance import MODES, AssistanceManager
 from .core import MPPI, MppiConfig, Route
 from .ground_mapping import GroundMapper, SemanticMapper, write_snapshot
-from .maps import LocalGridMap, MapStack, TerrainMap
+from .maps import AssistanceEvaluation, LocalGridMap, MapStack, TerrainMap
 from .routes import find_default_route, load_route
 from .uav_ground_truth import GroundTruthUav
 from .visualization import GazeboMarkers
@@ -83,6 +83,17 @@ class GazeboAutonomy:
             map_size_m=args.uav_map_size,
             request_handler=ground_truth_uav,
         )
+        # Assistance evaluation is the most expensive thing in the control
+        # tick. It runs every tick by default so the counterfactual sees the
+        # same rollout population the planner just acted on, and so per-cell
+        # uncertainty maturity is sampled at the full 20 Hz it was calibrated
+        # against. Raising this trades that fidelity for tick budget: the
+        # state machine still advances every tick on the cached evaluation,
+        # so stops, requests, and fusion stay responsive, but a longer period
+        # weakens the maturity gate, which biases toward more requests.
+        self.assistance_period_s = float(args.assistance_period)
+        self.last_assistance_s = -math.inf
+        self.last_evaluation = AssistanceEvaluation(0.0, None)
         self.arrival_radius = args.arrival_radius
         self.lock = threading.Lock()
         self.mapping_lock = threading.Lock()
@@ -339,12 +350,20 @@ class GazeboAutonomy:
             self.markers.update(self.route.xy, self.route_anchors, self.planner.best_trajectory())
         trajectories = self.planner.last_trajectories
         planned = trajectories[:, 1:] if trajectories is not None else trajectories
-        evaluation = self.map_stack.evaluate_assistance(
-            planned,
-            (x, y),
-            self.assistance.uncertainty_threshold,
-            self.now(),
-        )
+        now_s = self.now()
+        # A world reset moves the clock backwards; re-anchor instead of
+        # blocking evaluation until the old timestamp comes around again.
+        if now_s < self.last_assistance_s:
+            self.last_assistance_s = -math.inf
+        if now_s - self.last_assistance_s >= self.assistance_period_s:
+            self.last_evaluation = self.map_stack.evaluate_assistance(
+                planned,
+                (x, y),
+                self.assistance.uncertainty_threshold,
+                now_s,
+            )
+            self.last_assistance_s = now_s
+        evaluation = self.last_evaluation
         self.assistance.update(
             evaluation.uncertainty_exposure,
             evaluation.roi,
@@ -474,6 +493,10 @@ def parse_args() -> argparse.Namespace:
         "--mapping-uncertainty-maturity", type=float, default=1.0,
         help="seconds one unresolved swept cell must persist before exposure",
     )
+    parser.add_argument(
+        "--assistance-period", type=float, default=0.0,
+        help="seconds between swept-map assistance evaluations; 0 evaluates every tick",
+    )
     parser.add_argument("--uav-map-size", type=float, default=25.0)
     parser.add_argument("--uav-resolution", type=float, default=0.25)
     parser.add_argument(
@@ -521,6 +544,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("speed limits must be positive and speed-max must include target-speed")
     if not 0.0 <= args.uav_uncertainty_threshold <= 1.0:
         parser.error("uav-uncertainty-threshold must be between 0 and 1")
+    if args.assistance_period < 0.0:
+        parser.error("assistance-period may not be negative")
     if args.mapping_uncertainty_maturity < 0.0:
         parser.error("mapping-uncertainty-maturity must be non-negative")
     if args.uav_map_size <= 0.0 or args.uav_resolution <= 0.0:

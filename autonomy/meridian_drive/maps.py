@@ -435,10 +435,19 @@ class MapStack:
         # Meridian counts distinct swept cells, not repeated trajectory visits.
         cell_x = np.floor(x[valid] / layer.resolution).astype(np.int64)
         cell_y = np.floor(y[valid] / layer.resolution).astype(np.int64)
-        cells = np.column_stack((cell_x, cell_y, uncertain[valid].astype(np.int8)))
-        coordinates, inverse = np.unique(cells[:, :2], axis=0, return_inverse=True)
+        # np.unique(axis=0) sorts a two-column void view, which falls back to
+        # generic element comparison: ~25 ms for a full swept population, twice
+        # per control tick. Packing the pair into one int64 and taking the 1-D
+        # path is ~10x faster for an identical result. Cell indices are grid
+        # coordinates, far inside the 32-bit half each field gets.
+        keys = (cell_x << 32) | (cell_y & 0xFFFFFFFF)
+        unique_keys, inverse = np.unique(keys, return_inverse=True)
+        coordinates = np.column_stack((
+            unique_keys >> 32,
+            ((unique_keys & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000,
+        ))
         raw_flags = np.zeros(len(coordinates), dtype=bool)
-        np.logical_or.at(raw_flags, inverse, cells[:, 2].astype(bool))
+        np.logical_or.at(raw_flags, inverse, uncertain[valid])
         flags = self._mature_uncertainty(source, coordinates, raw_flags, now_s)
         exposure = float(np.mean(flags))
         if not np.any(flags):
