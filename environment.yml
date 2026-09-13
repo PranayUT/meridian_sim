@@ -1,0 +1,13 @@
+name: rugged-ugv
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - gz-sim8=8.10.*
+  - gz-launch7=7.1.*
+  - gz-transport13=13.5.*
+  - gz-msgs10=10.3.*
+  - numpy=2.*
+  - pillow>=11
+  - matplotlib=3.*

@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<!-- Runtime validation world: skips rendering so it works on GPU-less CI hosts. -->
+<sdf version="1.10">
+  <world name="headless_smoke">
+    <physics name="1ms" type="ignored"><max_step_size>0.001</max_step_size><real_time_factor>1.0</real_time_factor></physics>
+    <gravity>0 0 -9.81</gravity>
+    <spherical_coordinates><surface_model>EARTH_WGS84</surface_model><world_frame_orientation>ENU</world_frame_orientation><latitude_deg>30.326139</latitude_deg><longitude_deg>-98.148264</longitude_deg><elevation>230.112</elevation><heading_deg>0</heading_deg></spherical_coordinates>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
+    <plugin filename="gz-sim-navsat-system" name="gz::sim::systems::NavSat"/>
+    <include><uri>model://hill_terrain</uri></include>
+    <include><uri>model://hill_rover</uri></include>
+  </world>
+</sdf>

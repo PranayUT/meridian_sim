@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<sdf version="1.10">
+  <world name="hill_country">
+    <physics name="1ms" type="ignored"><max_step_size>0.001</max_step_size><real_time_factor>1.0</real_time_factor></physics>
+    <gravity>0 0 -9.81</gravity>
+    <spherical_coordinates><surface_model>EARTH_WGS84</surface_model><world_frame_orientation>ENU</world_frame_orientation><latitude_deg>30.326139</latitude_deg><longitude_deg>-98.148264</longitude_deg><elevation>230.112</elevation><heading_deg>0</heading_deg></spherical_coordinates>
+
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors"><render_engine>ogre2</render_engine></plugin>
+    <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
+    <plugin filename="gz-sim-navsat-system" name="gz::sim::systems::NavSat"/>
+
+    <scene><ambient>0.55 0.58 0.52 1</ambient><background>0.55 0.70 0.88 1</background><shadows>true</shadows><grid>false</grid></scene>
+    <light name="sun" type="directional"><cast_shadows>true</cast_shadows><pose>0 0 100 0 0 0</pose><diffuse>0.95 0.90 0.78 1</diffuse><specular>0.2 0.2 0.2 1</specular><direction>-0.4 0.25 -0.88</direction></light>
+
+    <include><uri>model://hill_terrain</uri></include>
+    <include><uri>model://hill_rover</uri></include>
+
+    <!-- Fixed UAV surrogate. The optical axis points down at the world origin. -->
+    <model name="uav_top_down">
+      <static>true</static>
+      <pose>0 40 220 0 1.57079632679 0</pose>
+      <link name="camera_link">
+        <sensor name="top_down_camera" type="camera">
+          <topic>/uav/top_down/image</topic>
+          <update_rate>2</update_rate>
+          <always_on>true</always_on>
+          <camera>
+            <horizontal_fov>1.57079632679</horizontal_fov>
+            <image><width>1024</width><height>1024</height><format>R8G8B8</format></image>
+            <clip><near>1.0</near><far>400</far></clip>
+          </camera>
+        </sensor>
+      </link>
+    </model>
+
+    <!-- Feature instances are deliberately explicit so they are easy to move or copy. -->
+
+    <model name="rock_01"><static>true</static><pose>6 -3 21.855 0.15 0.05 0.2</pose><link name="rock"><collision name="collision"><geometry><ellipsoid><radii>0.8 0.55 0.45</radii></ellipsoid></geometry></collision><visual name="visual"><plugin filename="gz-sim-label-system" name="gz::sim::systems::Label"><label>40</label></plugin><geometry><ellipsoid><radii>0.8 0.55 0.45</radii></ellipsoid></geometry><material><diffuse>0.27 0.25 0.21 1</diffuse></material></visual></link></model>
+    <model name="rock_02"><static>true</static><pose>16 7 21.716 -0.1 0.2 -0.4</pose><link name="rock"><collision name="collision"><geometry><ellipsoid><radii>1.1 0.75 0.6</radii></ellipsoid></geometry></collision><visual name="visual"><plugin filename="gz-sim-label-system" name="gz::sim::systems::Label"><label>40</label></plugin><geometry><ellipsoid><radii>1.1 0.75 0.6</radii></ellipsoid></geometry><material><diffuse>0.31 0.29 0.25 1</diffuse></material></visual></link></model>
+    <!-- Placed via tools/place_obstacles.py (bush) -->
+    <!-- BEGIN PAINTED VEGETATION: managed by tools/place_obstacles.py -->
+    <include><name>painted_vegetation</name><uri>model://painted_vegetation</uri></include>
+    <!-- END PAINTED VEGETATION -->
+  </world>
+</sdf>

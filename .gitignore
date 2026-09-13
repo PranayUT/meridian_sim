@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+*.pyc
+.gz/
+runtime/
+
+# Terrain sources and derivatives: ~1.5 GB of USGS rasters and the DEM built
+# from them. Fetched and regenerated, not authored here — see
+# tools/generate_terrain.py. The painter's saved strokes stay tracked.
+maps/*.tif
+maps/*.vrt
+maps/*.zip
+
+# Batched vegetation, ~167 MB, regenerated from maps/vegetation_paint.npz by
+# tools/vegetation.py. The material file is small and hand-written.
+models/painted_vegetation/meshes/*.obj
