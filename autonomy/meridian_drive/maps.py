@@ -8,6 +8,24 @@ from pathlib import Path
 
 import numpy as np
 
+# A UAV result answers one raised source. Meridian names the product it
+# delivers, so the planner can tell which evidence channel the map is
+# entitled to speak for.
+SEMANTIC_MAP_TYPE = "semantic_traversability"
+OCCUPANCY_MAP_TYPE = "canopy_obstacle"
+
+# Maturity state is held as a sorted key array plus its timestamps so lookups
+# are a searchsorted rather than a per-cell dict probe. Cell indices are grid
+# coordinates, far inside the 32-bit half each field gets.
+_EMPTY_MATURITY: tuple[np.ndarray, np.ndarray] = (
+    np.empty(0, dtype=np.int64),
+    np.empty(0, dtype=np.float64),
+)
+
+
+def _pack_cells(cell_x: np.ndarray, cell_y: np.ndarray) -> np.ndarray:
+    return (cell_x.astype(np.int64) << 32) | (cell_y.astype(np.int64) & 0xFFFFFFFF)
+
 
 @dataclass(frozen=True)
 class TerrainMap:
@@ -93,10 +111,19 @@ class UavMap:
     origin_y: float
     resolution: float
     sequence: int
+    map_types: tuple[str, ...] = ()
 
     @property
     def shape(self) -> tuple[int, int]:
         return self.cost_grid.shape
+
+    def provides(self, map_type: str) -> bool:
+        """True when this result answers the named evidence channel.
+
+        A map that declares no types is a legacy or external product that
+        carries every layer, so it still supersedes both channels.
+        """
+        return not self.map_types or map_type in self.map_types
 
     def sample(self, x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         col = np.floor((x - self.origin_x) / self.resolution).astype(np.int64)
@@ -146,7 +173,14 @@ def _load_native(archive: object, names: set[str]) -> UavMap:
     origin = np.asarray(archive[origin_key], dtype=np.float64)
     resolution = float(_scalar(archive, "resolution"))
     sequence = int(_scalar(archive, "sequence")) if "sequence" in names else 0
-    return _validate(cost, obstacle, uncertainty, origin, resolution, sequence)
+    map_types = (
+        tuple(str(item) for item in np.asarray(archive["map_types"]).reshape(-1).tolist())
+        if "map_types" in names
+        else ()
+    )
+    return _validate(
+        cost, obstacle, uncertainty, origin, resolution, sequence, map_types
+    )
 
 
 def _load_meridian(archive: object, names: set[str]) -> UavMap:
@@ -219,6 +253,7 @@ def _validate(
     origin: np.ndarray,
     resolution: float,
     sequence: int,
+    map_types: tuple[str, ...] = (),
 ) -> UavMap:
     if cost.shape != obstacle.shape or cost.shape != uncertainty.shape:
         raise MapFormatError("cost, obstacle, and uncertainty must have the same shape")
@@ -236,6 +271,7 @@ def _validate(
         origin_y=float(origin[1]),
         resolution=resolution,
         sequence=sequence,
+        map_types=map_types,
     )
 
 
@@ -268,7 +304,7 @@ class MapStack:
     collision_probability: float = 0.65
     semantic_collision_probability: float = 0.45
     uncertainty_maturity_s: float = 1.0
-    _uncertain_since: dict[str, dict[tuple[int, int], float]] = field(
+    _uncertain_since: dict[str, tuple[np.ndarray, np.ndarray]] = field(
         default_factory=dict, init=False, repr=False
     )
     _maturity_update_s: dict[str, float] = field(
@@ -372,7 +408,7 @@ class MapStack:
             trajectories,
             self.ground_semantic_uncertainty,
             source="ground_semantic_cost",
-            map_type="semantic_traversability",
+            map_type=SEMANTIC_MAP_TYPE,
             uncertainty_min=0.04,
             now_s=now_s,
         )
@@ -422,7 +458,7 @@ class MapStack:
             uncertain |= valid & (
                 (~known_probability) | ((probability >= 0.20) & (probability <= 0.80))
             )
-        if self.aerial is not None:
+        if self.aerial is not None and self.aerial.provides(map_type):
             _, _, aerial_uncertainty, aerial_valid = self.aerial.sample(x, y)
             uncertain = np.where(
                 aerial_valid,
@@ -475,7 +511,7 @@ class MapStack:
             trajectories,
             self.ground_occupancy_uncertainty,
             source="lidar_occupancy",
-            map_type="canopy_obstacle",
+            map_type=OCCUPANCY_MAP_TYPE,
             uncertainty_min=0.04,
             probability_layer=self.ground_obstacle_probability,
             now_s=now_s,
@@ -495,7 +531,7 @@ class MapStack:
             uncertain = (~known) | (variance >= 0.04) | (
                 (probability >= 0.20) & (probability <= 0.80)
             )
-            if self.aerial is not None:
+            if self.aerial is not None and self.aerial.provides(OCCUPANCY_MAP_TYPE):
                 _, aerial_probability, aerial_uncertainty, aerial_valid = self.aerial.sample(x, y)
                 probability = np.where(aerial_valid, aerial_probability, probability)
                 uncertain = np.where(aerial_valid, aerial_uncertainty >= 0.04, uncertain)
@@ -558,18 +594,28 @@ class MapStack:
             self._uncertain_since.pop(source, None)
         self._maturity_update_s[source] = now_s
 
-        history = self._uncertain_since.setdefault(source, {})
-        current: dict[tuple[int, int], float] = {}
         mature = np.zeros_like(uncertain)
-        for index in np.flatnonzero(uncertain):
-            key = (int(coordinates[index, 0]), int(coordinates[index, 1]))
-            since = history.get(key, now_s)
-            current[key] = since
-            mature[index] = now_s - since >= self.uncertainty_maturity_s
+        selected = np.flatnonzero(uncertain)
         # Dropping a cell from the current rollout population resets its
         # opportunity window. This is what distinguishes a moving frontier
-        # from one location that remains unresolved under repeated planning.
-        self._uncertain_since[source] = current
+        # from one location that remains unresolved under repeated planning,
+        # so only the cells uncertain right now are carried forward.
+        if selected.size == 0:
+            self._uncertain_since[source] = _EMPTY_MATURITY
+            return mature
+        keys = _pack_cells(coordinates[selected, 0], coordinates[selected, 1])
+        order = np.argsort(keys, kind="stable")
+        keys, selected = keys[order], selected[order]
+        since = np.full(keys.shape, now_s, dtype=np.float64)
+        known_keys, known_since = self._uncertain_since.get(source, _EMPTY_MATURITY)
+        if known_keys.size:
+            index = np.minimum(
+                np.searchsorted(known_keys, keys), known_keys.size - 1
+            )
+            carried = known_keys[index] == keys
+            since[carried] = known_since[index[carried]]
+        self._uncertain_since[source] = (keys, since)
+        mature[selected] = (now_s - since) >= self.uncertainty_maturity_s
         return mature
 
     def _mature_sample_uncertainty(
@@ -584,18 +630,22 @@ class MapStack:
         """Apply the exposure maturity state to counterfactual samples too."""
         if now_s is None or self.uncertainty_maturity_s <= 0.0:
             return uncertain
-        history = self._uncertain_since.get(source, {})
-        cell_x = np.floor(x / resolution).astype(np.int64).reshape(-1)
-        cell_y = np.floor(y / resolution).astype(np.int64).reshape(-1)
         raw = uncertain.reshape(-1)
         mature = np.zeros_like(raw)
-        now_s = float(now_s)
-        for index in np.flatnonzero(raw):
-            since = history.get((int(cell_x[index]), int(cell_y[index])))
-            mature[index] = (
-                since is not None
-                and now_s - since >= self.uncertainty_maturity_s
-            )
+        known_keys, known_since = self._uncertain_since.get(source, _EMPTY_MATURITY)
+        selected = np.flatnonzero(raw)
+        if known_keys.size == 0 or selected.size == 0:
+            return mature.reshape(uncertain.shape)
+        keys = _pack_cells(
+            np.floor(x.reshape(-1)[selected] / resolution),
+            np.floor(y.reshape(-1)[selected] / resolution),
+        )
+        index = np.minimum(np.searchsorted(known_keys, keys), known_keys.size - 1)
+        # A cell absent from the exposure state was never counted as a mature
+        # uncertain cell, so it cannot be substituted by the counterfactual.
+        mature[selected] = (known_keys[index] == keys) & (
+            (float(now_s) - known_since[index]) >= self.uncertainty_maturity_s
+        )
         return mature.reshape(uncertain.shape)
 
     def _swept_points(self, trajectories: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

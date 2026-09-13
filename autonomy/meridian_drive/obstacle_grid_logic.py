@@ -1269,26 +1269,36 @@ class LocalGrid:
         endpoints = points[order[last]]
 
         sx, sy, sz = (float(value) for value in sensor_xyz)
-        for endpoint in endpoints:
-            dx = float(endpoint[0]) - sx
-            dy = float(endpoint[1]) - sy
-            horizontal = float(np.hypot(dx, dy))
-            steps = max(1, int(np.ceil(horizontal / self.res)))
-            for step in range(1, steps):
-                fraction = step / steps
-                x = sx + fraction * dx
-                y = sy + fraction * dy
-                col = int(np.floor((x - self.origin_x) / self.res))
-                row = int(np.floor((y - self.origin_y) / self.res))
-                if not (0 <= row < self.n and 0 <= col < self.n):
-                    continue
-                floor = float(ground[row, col])
-                if not np.isfinite(floor):
-                    continue
-                ray_z = sz + fraction * (float(endpoint[2]) - sz)
-                height = ray_z - floor
-                if 0.0 <= height <= body_band_hi_m:
-                    clear[row, col] = True
+        ray_dx = endpoints[:, 0] - sx
+        ray_dy = endpoints[:, 1] - sy
+        ray_dz = endpoints[:, 2] - sz
+        steps = np.maximum(
+            1, np.ceil(np.hypot(ray_dx, ray_dy) / self.res).astype(np.int64)
+        )
+        # Every ray walks a different number of cells, so the per-ray step
+        # index is built from the run-length layout rather than a Python loop.
+        # Marching one cell at a time in Python cost ~31 ms of the ~37 ms this
+        # update takes, and this runs at 10 Hz in the same interpreter as the
+        # 20 Hz controller, so it was the dominant source of missed cycles.
+        counts = steps - 1
+        total = int(counts.sum())
+        if total == 0:
+            return clear
+        ray = np.repeat(np.arange(len(steps)), counts)
+        starts = np.repeat(np.cumsum(counts) - counts, counts)
+        fraction = (np.arange(total) - starts + 1) / steps[ray]
+        x = sx + fraction * ray_dx[ray]
+        y = sy + fraction * ray_dy[ray]
+        col = np.floor((x - self.origin_x) / self.res).astype(np.int64)
+        row = np.floor((y - self.origin_y) / self.res).astype(np.int64)
+        inside = (row >= 0) & (row < self.n) & (col >= 0) & (col < self.n)
+        row, col = row[inside], col[inside]
+        floor = ground[row, col]
+        height = (sz + fraction[inside] * ray_dz[ray[inside]]) - floor
+        # A non-finite floor leaves height non-finite, which fails both
+        # comparisons, so unknown ground is skipped exactly as before.
+        crossed = (height >= 0.0) & (height <= body_band_hi_m)
+        clear[row[crossed], col[crossed]] = True
         return clear
 
     def to_grid(self, cls: np.ndarray) -> Grid:

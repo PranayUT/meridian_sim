@@ -24,7 +24,7 @@ class AssistanceManager:
     map_stack: MapStack
     uncertainty_threshold: float = 0.20
     map_size_m: float = 25.0
-    request_handler: Callable[[tuple[float, float, float, float], int], None] | None = None
+    request_handler: Callable[[tuple[float, float, float, float], int, str], None] | None = None
     persistence_s: float = 2.0
     stop_speed_mps: float = 0.08
     stop_settle_s: float = 0.5
@@ -244,7 +244,9 @@ class AssistanceManager:
         )
         if self.request_handler is not None:
             try:
-                self.request_handler(roi, self._request_count)
+                # The producer receives the named product so the response
+                # answers the source that was raised and nothing else.
+                self.request_handler(roi, self._request_count, map_type)
             except Exception as error:
                 self.detail = f"simulated UAV failed: {error}"
                 return

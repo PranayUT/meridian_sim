@@ -13,12 +13,20 @@ import numpy as np
 from autonomy.meridian_drive.assistance import AssistanceManager
 from autonomy.meridian_drive.core import MPPI, MppiConfig, Route, VehicleModel, rollout
 from autonomy.meridian_drive.ground_mapping import SemanticMapper
-from autonomy.meridian_drive.maps import LocalGridMap, MapStack, TerrainMap, load_uav_map
+from autonomy.meridian_drive.maps import (
+    OCCUPANCY_MAP_TYPE,
+    SEMANTIC_MAP_TYPE,
+    LocalGridMap,
+    MapStack,
+    TerrainMap,
+    load_uav_map,
+)
 from autonomy.meridian_drive.obstacle_grid_logic import (
     GROUND,
     SOLID,
     TALL,
     UNSEEN,
+    LocalGrid,
     ProbabilisticOccupancyGrid,
     classify,
     rasterize_window,
@@ -203,6 +211,67 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(float(support[0, 0]), 3.0)
         # Structural classification still sees only one actual sweep.
         self.assertNotEqual(int(grid.classes()[0, 1]), SOLID)
+
+
+class RayClearTests(unittest.TestCase):
+    """Pin the vectorised ray march: this is the mapping thread's hot loop."""
+
+    def _grid(self) -> LocalGrid:
+        grid = LocalGrid(0.25, 40.0, history=10, ground_history=100)
+        grid.origin_x = -20.0
+        grid.origin_y = -20.0
+        return grid
+
+    def test_ray_clears_cells_inside_the_body_band_but_not_the_endpoint(self) -> None:
+        grid = self._grid()
+        ground = np.zeros((grid.n, grid.n), dtype=np.float64)
+        # One return 5 m out along +X, with the sensor and the ray inside the
+        # collision band the whole way.
+        xyz = np.asarray([[5.0, 0.0, 0.3]])
+        clear = grid._ray_clear_mask(
+            xyz, ground, (0.0, 0.0, 0.3), body_band_hi_m=0.45
+        )
+        row = int(np.floor((0.0 - grid.origin_y) / grid.res))
+        first = int(np.floor((0.25 - grid.origin_x) / grid.res))
+        endpoint = int(np.floor((5.0 - grid.origin_x) / grid.res))
+        self.assertTrue(clear[row, first])
+        self.assertFalse(clear[row, endpoint])
+        self.assertEqual(int(clear.sum()), 19)
+
+    def test_canopy_ray_does_not_clear_beneath_itself(self) -> None:
+        grid = self._grid()
+        ground = np.zeros((grid.n, grid.n), dtype=np.float64)
+        # Same geometry, but the whole ray rides 2 m above the floor.
+        high = np.asarray([[5.0, 0.0, 2.0]])
+        clear = grid._ray_clear_mask(
+            high, ground, (0.0, 0.0, 2.0), body_band_hi_m=0.45
+        )
+        self.assertEqual(int(clear.sum()), 0)
+
+    def test_unknown_ground_and_degenerate_scans_clear_nothing(self) -> None:
+        grid = self._grid()
+        unknown = np.full((grid.n, grid.n), np.nan, dtype=np.float64)
+        xyz = np.asarray([[5.0, 0.0, 0.3]])
+        self.assertEqual(
+            int(grid._ray_clear_mask(
+                xyz, unknown, (0.0, 0.0, 0.3), body_band_hi_m=0.45
+            ).sum()),
+            0,
+        )
+        ground = np.zeros((grid.n, grid.n), dtype=np.float64)
+        for label, points, sensor in (
+            ("empty", np.empty((0, 3)), (0.0, 0.0, 0.3)),
+            ("no sensor", xyz, None),
+            # Returns closer than one cell have no interior to march.
+            ("sub-resolution", np.asarray([[0.1, 0.0, 0.3]]), (0.0, 0.0, 0.3)),
+        ):
+            with self.subTest(label):
+                self.assertEqual(
+                    int(grid._ray_clear_mask(
+                        points, ground, sensor, body_band_hi_m=0.45
+                    ).sum()),
+                    0,
+                )
 
 
 class MapTests(unittest.TestCase):
@@ -481,6 +550,73 @@ class MapTests(unittest.TestCase):
                 self.assertEqual(int(archive["sequence"]), 3)
             layer = load_uav_map(path)
             self.assertEqual(layer.shape, (100, 100))
+
+    def test_ground_truth_uav_delivers_only_the_requested_product(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "uav.npz"
+            producer = GroundTruthUav(
+                path, [Plant("tree", 0.0, 0.0, 0.0, 1.0, 0.0)]
+            )
+
+            producer((-12.5, -12.5, 12.5, 12.5), 1, SEMANTIC_MAP_TYPE)
+            with np.load(path, allow_pickle=False) as archive:
+                semantic_names = set(archive.files)
+                self.assertIn(28, archive["semantic_label"])
+            self.assertIn("cost", semantic_names)
+            self.assertNotIn("occupancy", semantic_names)
+            semantic_map = load_uav_map(path)
+            self.assertEqual(semantic_map.map_types, (SEMANTIC_MAP_TYPE,))
+            self.assertTrue(semantic_map.provides(SEMANTIC_MAP_TYPE))
+            self.assertFalse(semantic_map.provides(OCCUPANCY_MAP_TYPE))
+
+            producer((-12.5, -12.5, 12.5, 12.5), 2, OCCUPANCY_MAP_TYPE)
+            with np.load(path, allow_pickle=False) as archive:
+                occupancy_names = set(archive.files)
+                self.assertGreater(np.count_nonzero(archive["occupancy"]), 0)
+            self.assertIn("obstacle", occupancy_names)
+            self.assertNotIn("cost", occupancy_names)
+            self.assertNotIn("semantic_label", occupancy_names)
+            occupancy_map = load_uav_map(path)
+            self.assertEqual(occupancy_map.map_types, (OCCUPANCY_MAP_TYPE,))
+            self.assertFalse(occupancy_map.provides(SEMANTIC_MAP_TYPE))
+
+            with self.assertRaises(ValueError):
+                producer((-12.5, -12.5, 12.5, 12.5), 3, "terrain_slope")
+
+    def test_semantic_uav_map_does_not_resolve_occupancy_uncertainty(self) -> None:
+        uncertain = np.full((4, 4), 0.25, dtype=np.float32)
+        stack = MapStack(
+            ground_occupancy_uncertainty=LocalGridMap(uncertain, 0.0, 0.0, 1.0),
+            ground_semantic_uncertainty=LocalGridMap(uncertain, 0.0, 0.0, 1.0),
+            uncertainty_maturity_s=0.0,
+        )
+        trajectories = np.asarray([[[0.5, 0.5], [1.5, 0.5], [2.5, 0.5], [3.5, 0.5]]])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "semantic.npz"
+            np.savez_compressed(
+                path,
+                cost=np.zeros((4, 4), dtype=np.float32),
+                obstacle=np.zeros((4, 4), dtype=np.float32),
+                uncertainty=np.zeros((4, 4), dtype=np.float32),
+                map_types=np.asarray((SEMANTIC_MAP_TYPE,)),
+                origin_xy=np.asarray((0.0, 0.0)),
+                resolution=np.asarray(1.0),
+            )
+            stack.aerial = load_uav_map(path)
+
+        # The semantic answer clears its own channel, so occupancy is now the
+        # only source still raised and keeps the full swept exposure.
+        semantic = stack._evidence_exposure(
+            trajectories,
+            stack.ground_semantic_uncertainty,
+            source="ground_semantic_cost",
+            map_type=SEMANTIC_MAP_TYPE,
+            uncertainty_min=0.04,
+        )
+        occupancy = stack.evaluate_assistance(trajectories, None, 0.2)
+        self.assertEqual(semantic.uncertainty_exposure, 0.0)
+        self.assertEqual(occupancy.source, "lidar_occupancy")
+        self.assertEqual(occupancy.uncertainty_exposure, 1.0)
 
     def test_ground_only_never_loads_a_stale_uav_map(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

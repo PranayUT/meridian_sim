@@ -12,6 +12,7 @@ import numpy as np
 from tools.vegetation import Plant, plants_from_masks
 
 from .ground_mapping import GOOSE_COSTS, SEMANTIC_OBSTACLE_LABELS
+from .maps import OCCUPANCY_MAP_TYPE, SEMANTIC_MAP_TYPE
 
 
 @dataclass(frozen=True)
@@ -64,7 +65,25 @@ class GroundTruthUav:
         )
         return cls(result_path, plants, _labeled_ellipses(world_path), resolution)
 
-    def __call__(self, roi: tuple[float, float, float, float], sequence: int) -> None:
+    def __call__(
+        self,
+        roi: tuple[float, float, float, float],
+        sequence: int,
+        map_type: str = "",
+    ) -> None:
+        """Write the product the request raised, and only that product.
+
+        A request names one evidence channel because one channel crossed its
+        uncertainty rule. Delivering the other channel as well would let an
+        occupancy question silently resolve semantic cells that no source ever
+        asked about, and vice versa. An unnamed type keeps the original
+        both-layer response for external callers.
+        """
+        if map_type and map_type not in (SEMANTIC_MAP_TYPE, OCCUPANCY_MAP_TYPE):
+            raise ValueError(f"unknown UAV map type: {map_type}")
+        map_types = (map_type,) if map_type else (SEMANTIC_MAP_TYPE, OCCUPANCY_MAP_TYPE)
+        wants_semantic = SEMANTIC_MAP_TYPE in map_types
+        wants_occupancy = OCCUPANCY_MAP_TYPE in map_types
         x0, y0, x1, y1 = roi
         width = int(round((x1 - x0) / self.resolution))
         height = int(round((y1 - y0) / self.resolution))
@@ -72,6 +91,11 @@ class GroundTruthUav:
             raise ValueError("requested UAV ROI is empty")
         labels = np.full((height, width), 31, dtype=np.uint8)  # GOOSE soil
         obstacle = np.zeros((height, width), dtype=np.float32)
+        # The two products disagree on extent by design: occupancy paints the
+        # physical body a wheel can strike, while semantic traversability
+        # paints the labeled canopy, matching what the ground semantic layer
+        # already treats as untraversable.
+        semantic_obstacle = np.zeros((height, width), dtype=np.float32)
 
         # Plants are ordered grass, bush, tree. Later, taller vegetation wins
         # the top-down semantic label just as it does in a UAV image.
@@ -83,6 +107,8 @@ class GroundTruthUav:
             if not _intersects(plant.x, plant.y, radius, x0, y0, x1, y1):
                 continue
             _paint_ellipse(labels, goose_label[plant.kind], plant.x, plant.y, radius, radius, 0.0, x0, y0, self.resolution)
+            if goose_label[plant.kind] in SEMANTIC_OBSTACLE_LABELS:
+                _paint_ellipse(semantic_obstacle, 1.0, plant.x, plant.y, radius, radius, 0.0, x0, y0, self.resolution)
             if plant.kind in occupancy_radius:
                 body = occupancy_radius[plant.kind] * plant.scale
                 _paint_ellipse(obstacle, 1.0, plant.x, plant.y, body, body, 0.0, x0, y0, self.resolution)
@@ -94,25 +120,29 @@ class GroundTruthUav:
             _paint_ellipse(labels, feature.label, feature.x, feature.y, feature.radius_x, feature.radius_y, feature.yaw, x0, y0, self.resolution)
             if feature.label in SEMANTIC_OBSTACLE_LABELS:
                 _paint_ellipse(obstacle, 1.0, feature.x, feature.y, feature.radius_x, feature.radius_y, feature.yaw, x0, y0, self.resolution)
+                _paint_ellipse(semantic_obstacle, 1.0, feature.x, feature.y, feature.radius_x, feature.radius_y, feature.yaw, x0, y0, self.resolution)
 
-        cost = GOOSE_COSTS[labels].astype(np.float32)
-        uncertainty = np.zeros_like(cost)
+        payload: dict[str, np.ndarray] = {
+            "uncertainty": np.zeros((height, width), dtype=np.float32),
+            "map_types": np.asarray(map_types),
+            "origin_xy": np.asarray((x0, y0), dtype=np.float64),
+            "resolution": np.asarray(self.resolution),
+            "sequence": np.asarray(sequence),
+        }
+        if wants_semantic:
+            payload["cost"] = GOOSE_COSTS[labels].astype(np.float32)
+            payload["semantic_label"] = labels
+        if wants_occupancy:
+            payload["occupancy"] = (100.0 * obstacle).astype(np.uint8)
+        # Both products carry an obstacle raster, but each carries its own:
+        # a combined response keeps occupancy's physical bodies.
+        payload["obstacle"] = obstacle if wants_occupancy else semantic_obstacle
         temporary = self.result_path.with_name(
             f".{self.result_path.name}.{os.getpid()}.tmp.npz"
         )
         self.result_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            np.savez_compressed(
-                temporary,
-                cost=cost,
-                obstacle=obstacle,
-                uncertainty=uncertainty,
-                occupancy=(100.0 * obstacle).astype(np.uint8),
-                semantic_label=labels,
-                origin_xy=np.asarray((x0, y0), dtype=np.float64),
-                resolution=np.asarray(self.resolution),
-                sequence=np.asarray(sequence),
-            )
+            np.savez_compressed(temporary, **payload)
             os.replace(temporary, self.result_path)
         finally:
             temporary.unlink(missing_ok=True)
