@@ -300,6 +300,7 @@ def run_trial(
         "--uav-source", args.uav_source,
         "--uav-uncertainty-threshold", str(args.uav_uncertainty_threshold),
         "--mapping-uncertainty-maturity", str(args.mapping_uncertainty_maturity),
+        "--assistance-period", str(args.assistance_period),
         "--uav-map-size", str(args.uav_map_size),
         "--uav-map", str(args.run_dir / "uav_map.npz"),
         "--seed", str(trial.seed),
@@ -434,6 +435,8 @@ def main() -> int:
     parser.add_argument("--uav-source", choices=("ground_truth", "file"), default="ground_truth")
     parser.add_argument("--uav-uncertainty-threshold", type=float, default=0.20)
     parser.add_argument("--mapping-uncertainty-maturity", type=float, default=1.0)
+    parser.add_argument("--assistance-period", type=float, default=0.0,
+                        help="seconds between assistance evaluations; 0 evaluates every tick")
     parser.add_argument("--uav-map-size", type=float, default=25.0)
     parser.add_argument("--stuck-s", type=float, default=30.0, help="sim seconds without progress")
     parser.add_argument("--stuck-epsilon", type=float, default=0.5, help="m that counts as progress")
