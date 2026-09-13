@@ -325,6 +325,7 @@ def run_trial(
         try:
             sim_start, _, _, _, _ = watcher.snapshot()
             deadline_s = sim_start + trial.route_length_m / args.min_speed + args.grace_s
+            progress_required_m = args.min_route_progress * float(route.distance[-1])
             anchor_s, anchor_xy = sim_start, None
             while True:
                 time.sleep(0.25)
@@ -343,7 +344,13 @@ def run_trial(
                 route_progress_m = max(
                     route_progress_m, float(measured_progress[0])
                 )
-                if math.dist(xy, (goal[0], goal[1])) <= args.arrival_radius:
+                # Routes are loops: they finish within ~12 m of where they
+                # start, so proximity to the goal alone is not evidence the
+                # route was driven. Require the trial to have covered the route
+                # before arrival counts, or a rover that merely passes near the
+                # end point early is scored a success.
+                if (math.dist(xy, (goal[0], goal[1])) <= args.arrival_radius
+                        and route_progress_m >= progress_required_m):
                     outcome = "success"
                     break
                 if sim_s > deadline_s:
@@ -411,6 +418,7 @@ def run_trial(
         "route_length_m": round(trial.route_length_m, 2),
         "interventions": interventions,
         "interventions_resolved": resolved,
+        "route_progress_m": round(route_progress_m, 2),
         "uav_requests": uav_requests,
         "assistance": args.assistance,
         "uav_uncertainty_threshold": args.uav_uncertainty_threshold,
@@ -442,9 +450,16 @@ def main() -> int:
     parser.add_argument("--stuck-epsilon", type=float, default=0.5, help="m that counts as progress")
     parser.add_argument("--drag-m", type=float, default=3.0)
     parser.add_argument("--max-interventions", type=int, default=20)
+    parser.add_argument("--min-route-progress", type=float, default=0.9,
+                        help="fraction of the route that must be covered before "
+                             "reaching the goal counts as success")
     parser.add_argument("--min-speed", type=float, default=0.5, help="sets the per-trial deadline")
     parser.add_argument("--grace-s", type=float, default=120.0)
-    parser.add_argument("--arrival-radius", type=float, default=0.25)
+    # 0.25 m was tighter than the rover's own footprint: a trial could drive its
+    # route correctly and still never be credited, circling the goal until the
+    # clock ran out. Verified on Route-12 forward seed 7, which timed out twice
+    # at 0.25 m and finished in 62% of its budget at 1.0 m.
+    parser.add_argument("--arrival-radius", type=float, default=1.0)
     parser.add_argument("--ride-height", type=float, default=0.25)
     parser.add_argument("--fallback-z", type=float, default=22.0)
     parser.add_argument("--veg-root", type=Path, default=None,
@@ -456,6 +471,8 @@ def main() -> int:
     parser.add_argument("--run-id", default=None,
                         help="names runtime/experiments/<id>/; defaults to a timestamp")
     args = parser.parse_args()
+    if not 0.0 <= args.min_route_progress <= 1.0:
+        parser.error("min-route-progress must be between 0 and 1")
     if not 0.0 <= args.uav_uncertainty_threshold <= 1.0:
         parser.error("uav-uncertainty-threshold must be between 0 and 1")
     if args.mapping_uncertainty_maturity < 0.0:
@@ -496,7 +513,8 @@ def main() -> int:
     results_path.parent.mkdir(parents=True, exist_ok=True)
     columns = ["cycle", "seed", "route", "direction", "outcome", "success",
                "sim_time_s", "wall_time_s", "path_length_m", "route_length_m",
-               "interventions", "interventions_resolved", "uav_requests",
+               "interventions", "interventions_resolved", "route_progress_m",
+               "uav_requests",
                "assistance", "uav_uncertainty_threshold",
                "mapping_uncertainty_maturity", "veg_seed"]
     rows: list[dict] = []

@@ -516,7 +516,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon", type=int, default=60)
     parser.add_argument("--target-speed", type=float, default=1.7)
     parser.add_argument("--speed-max", type=float, default=2.2)
-    parser.add_argument("--arrival-radius", type=float, default=0.25)
+    # Matches the harness default; see tools/run_experiment.py.
+    parser.add_argument("--arrival-radius", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--odometry-topic", default="/model/hill_rover/odometry")
     parser.add_argument("--world-pose-topic", default="/world/hill_country/dynamic_pose/info")
