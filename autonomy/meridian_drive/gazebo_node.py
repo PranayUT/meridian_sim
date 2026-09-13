@@ -52,6 +52,7 @@ class GazeboAutonomy:
         self.ground_map_path = args.ground_map
         self.last_map_write_s = 0.0
         self.latest_ground_obstacles: LocalGridMap | None = None
+        self.latest_ground_obstacle_probability: LocalGridMap | None = None
         self.latest_ground_semantics: LocalGridMap | None = None
         self.latest_ground_semantic_obstacles: LocalGridMap | None = None
         self.markers = None if args.no_visualization else GazeboMarkers(
@@ -226,6 +227,12 @@ class GazeboAutonomy:
                 self.latest_ground_obstacles = LocalGridMap(
                     self.ground_mapper.classes.copy(), origin[0], origin[1], 0.25
                 )
+                occupancy_probability = self.ground_mapper.occupancy.evidence_grid(
+                    scan_s
+                )[0]
+                self.latest_ground_obstacle_probability = LocalGridMap(
+                    occupancy_probability, origin[0], origin[1], 0.25
+                )
                 last_lidar_s = now_s
 
             semantic_changed = False
@@ -273,6 +280,9 @@ class GazeboAutonomy:
             return
         x, y, yaw, speed = pose
         self.map_stack.ground_obstacles = self.latest_ground_obstacles
+        self.map_stack.ground_obstacle_probability = (
+            self.latest_ground_obstacle_probability
+        )
         self.map_stack.ground_semantics = self.latest_ground_semantics
         self.map_stack.ground_semantic_obstacles = (
             self.latest_ground_semantic_obstacles

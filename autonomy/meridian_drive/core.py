@@ -7,6 +7,7 @@ transport stays in ``gazebo_node.py``.
 
 from __future__ import annotations
 
+import heapq
 import math
 from dataclasses import dataclass, field
 
@@ -42,6 +43,16 @@ class MppiConfig:
     steering_sigma: float = 0.28
     velocity_knots: int = 4
     steering_knots: int = 6
+    # Keep a small, deterministic bank of forward S-turns in every sample
+    # population. Pure Gaussian sampling loses all useful forward proposals
+    # after the nominal solution has slowed in front of an obstacle, leaving
+    # the optimizer unable to discover that driving around it is possible.
+    escape_samples: int = 32
+    minimum_safe_progress_m: float = 0.75
+    local_plan_lookahead_m: float = 10.0
+    local_plan_radius_m: float = 10.0
+    local_plan_resolution_m: float = 0.25
+    local_plan_period: int = 10
     # Meridian Drive's shipped values: path_cross_track_weight and
     # path_heading_weight in terrain_aware_mppi/config/mppi_params.yaml. Lowering
     # them does make the planner leave the line for obstacles, but it is treating
@@ -174,6 +185,201 @@ def _smooth_noise(rng: np.random.Generator, samples: int, horizon: int, knots: i
     return output
 
 
+def _escape_controls(config: MppiConfig) -> np.ndarray:
+    """Return paired forward S-turn proposals for obstacle escape.
+
+    These are absolute controls rather than perturbations of the warm start.
+    That distinction matters after MPPI has correctly slowed for an obstacle:
+    perturbing a near-zero speed sequence only proposes more ways to stop.
+    """
+    count = min(config.escape_samples, config.samples)
+    count -= count % 2
+    if count == 0:
+        return np.empty((0, config.horizon, 2), dtype=np.float64)
+
+    half = count // 2
+    output = np.zeros((count, config.horizon, 2), dtype=np.float64)
+    # Cover slow, tight manoeuvres and faster, wider passes. Cycling the
+    # parameters makes this work for sample counts smaller than the default.
+    speeds = (0.75, 1.10, 1.45, config.target_speed)
+    # The zero-amplitude group is equally important: once a local guide has
+    # led the rover alongside an obstacle, it must retain forward proposals
+    # even if the stochastic warm start has collapsed toward zero speed.
+    amplitudes = (0.0, 0.48, 0.70, 0.92)
+    turn_fractions = (0.18, 0.24, 0.30, 0.36)
+    for index in range(half):
+        speed = min(config.speed_max, speeds[index % len(speeds)])
+        amplitude = amplitudes[(index // len(speeds)) % len(amplitudes)]
+        fraction = turn_fractions[
+            (index // (len(speeds) * len(amplitudes))) % len(turn_fractions)
+        ]
+        turn_steps = max(2, min(config.horizon // 2, round(config.horizon * fraction)))
+        output[index, :, 0] = speed
+        output[index, :turn_steps, 1] = amplitude
+        output[index, turn_steps : 2 * turn_steps, 1] = -amplitude
+        output[index + half] = output[index]
+        output[index + half, :, 1] *= -1.0
+    return output
+
+
+def _line_is_clear(
+    start: tuple[int, int], end: tuple[int, int], blocked: np.ndarray
+) -> bool:
+    """Check a grid segment at cell-sized intervals."""
+    row0, col0 = start
+    row1, col1 = end
+    steps = max(abs(row1 - row0), abs(col1 - col0))
+    if steps == 0:
+        return not bool(blocked[row0, col0])
+    rows = np.rint(np.linspace(row0, row1, steps + 1)).astype(np.int64)
+    cols = np.rint(np.linspace(col0, col1, steps + 1)).astype(np.int64)
+    return not bool(np.any(blocked[rows, cols]))
+
+
+def _plan_guidance_route(
+    route: Route,
+    progress_m: float,
+    state: np.ndarray,
+    map_stack: object,
+    config: MppiConfig,
+) -> Route | None:
+    """Plan a collision-free local guide through the fused rolling map.
+
+    MPPI remains the motion planner and controller. This small A* layer only
+    replaces the centerline reference where that centerline is occupied, so a
+    detour wider than one rollout is represented in the objective.
+    """
+    resolution = config.local_plan_resolution_m
+    radius = config.local_plan_radius_m
+    target_s = min(
+        float(route.distance[-1]), progress_m + config.local_plan_lookahead_m
+    )
+    route_start = max(0, int(np.searchsorted(route.distance, progress_m)))
+    route_stop = min(len(route.xy), int(np.searchsorted(route.distance, target_s)) + 1)
+    centerline = route.xy[route_start:route_stop]
+    if len(centerline) == 0:
+        return None
+    centerline_cost, centerline_blocked = map_stack.cost(
+        centerline[:, 0], centerline[:, 1]
+    )
+    if not np.any(centerline_blocked) and not np.any(centerline_cost >= 3.5):
+        return None
+
+    cells = int(math.ceil(2.0 * radius / resolution)) + 1
+    origin_x = float(state[X]) - radius
+    origin_y = float(state[Y]) - radius
+    axis = np.arange(cells, dtype=np.float64) * resolution
+    grid_x, grid_y = np.meshgrid(origin_x + axis, origin_y + axis)
+    map_cost, blocked = map_stack.cost(grid_x, grid_y)
+    blocked = np.asarray(blocked, dtype=bool)
+    map_cost = np.nan_to_num(np.asarray(map_cost, dtype=np.float64), nan=0.0)
+    # High-confidence geometric occupancy is useful guidance but is not itself
+    # a hard collision claim: porous TALL vegetation can produce probability
+    # near one. Route the guide around it while leaving MPPI able to drive out
+    # if the rover already occupies one of those cells.
+    blocked |= map_cost >= 3.5
+
+    start = (cells // 2, cells // 2)
+    blocked[start] = False
+    target_index = min(int(np.searchsorted(route.distance, target_s)), len(route.xy) - 1)
+    target_xy = route.xy[target_index]
+
+    # If the centerline target itself is occupied, finish at the closest free
+    # cell beside it. The next replan advances that temporary target until the
+    # original route is reachable again.
+    free_rows, free_cols = np.nonzero(~blocked)
+    if len(free_rows) == 0:
+        return None
+    free_x = origin_x + free_cols * resolution
+    free_y = origin_y + free_rows * resolution
+    _, free_progress, _ = route.nearest(
+        free_x,
+        free_y,
+        max(0.0, progress_m - 0.5),
+        min(float(route.distance[-1]), target_s + radius),
+    )
+    target_distance = np.hypot(free_x - target_xy[0], free_y - target_xy[1])
+    behind = np.maximum(0.0, target_s - free_progress)
+    goal_choice = int(np.argmin(target_distance + 2.0 * behind))
+    goal = (int(free_rows[goal_choice]), int(free_cols[goal_choice]))
+    if goal == start:
+        return None
+
+    route_distance, _, _ = route.nearest(
+        grid_x,
+        grid_y,
+        max(0.0, progress_m - 1.0),
+        min(float(route.distance[-1]), target_s + radius),
+    )
+    best = np.full((cells, cells), np.inf, dtype=np.float64)
+    best[start] = 0.0
+    parent: dict[tuple[int, int], tuple[int, int]] = {}
+    queue: list[tuple[float, float, int, int]] = [(0.0, 0.0, *start)]
+    neighbours = (
+        (-1, 0, 1.0),
+        (1, 0, 1.0),
+        (0, -1, 1.0),
+        (0, 1, 1.0),
+        (-1, -1, math.sqrt(2.0)),
+        (-1, 1, math.sqrt(2.0)),
+        (1, -1, math.sqrt(2.0)),
+        (1, 1, math.sqrt(2.0)),
+    )
+    found = False
+    while queue:
+        _, cost_so_far, row, col = heapq.heappop(queue)
+        if cost_so_far != best[row, col]:
+            continue
+        if (row, col) == goal:
+            found = True
+            break
+        for drow, dcol, step_length in neighbours:
+            next_row, next_col = row + drow, col + dcol
+            if not (0 <= next_row < cells and 0 <= next_col < cells):
+                continue
+            if blocked[next_row, next_col]:
+                continue
+            cell_penalty = 0.20 * map_cost[next_row, next_col]
+            cell_penalty += 0.025 * route_distance[next_row, next_col] ** 2
+            candidate = cost_so_far + step_length * (1.0 + cell_penalty)
+            if candidate >= best[next_row, next_col]:
+                continue
+            best[next_row, next_col] = candidate
+            parent[(next_row, next_col)] = (row, col)
+            heuristic = math.hypot(goal[0] - next_row, goal[1] - next_col)
+            heapq.heappush(
+                queue,
+                (candidate + heuristic, candidate, next_row, next_col),
+            )
+    if not found:
+        return None
+
+    path = [goal]
+    while path[-1] != start:
+        path.append(parent[path[-1]])
+    path.reverse()
+
+    # Remove grid stair-steps. Keeping the farthest visible corner also gives
+    # MPPI a stable tangent instead of alternating horizontal/diagonal yaws.
+    corners = [path[0]]
+    index = 0
+    while index < len(path) - 1:
+        candidate = len(path) - 1
+        while candidate > index + 1 and not _line_is_clear(
+            path[index], path[candidate], blocked
+        ):
+            candidate -= 1
+        corners.append(path[candidate])
+        index = candidate
+    waypoints = [
+        (origin_x + col * resolution, origin_y + row * resolution)
+        for row, col in corners
+    ]
+    if len(waypoints) < 2:
+        return None
+    return Route.from_waypoints(waypoints, spacing=resolution)
+
+
 @dataclass
 class MPPI:
     """A ROS-free form of the Meridian Drive receding-horizon planner."""
@@ -190,11 +396,15 @@ class MPPI:
         self.last_trajectories: np.ndarray | None = None
         self.last_costs: np.ndarray | None = None
         self.progress_m = 0.0
+        self.guidance_route: Route | None = None
+        self._commands_since_plan = self.config.local_plan_period
 
     def reset(self) -> None:
         self.nominal.fill(0.0)
         self.previous.fill(0.0)
         self.progress_m = 0.0
+        self.guidance_route = None
+        self._commands_since_plan = self.config.local_plan_period
 
     def command(self, state: np.ndarray, map_stack: object, lidar_points: np.ndarray) -> np.ndarray:
         cfg = self.config
@@ -205,6 +415,26 @@ class MPPI:
             self.progress_m + 8.0,
         )
         self.progress_m = max(self.progress_m, float(current_progress[0]))
+        self._commands_since_plan += 1
+        guidance_distance = math.inf
+        if self.guidance_route is not None:
+            distance, _, _ = self.guidance_route.nearest(
+                np.asarray([state[X]]), np.asarray([state[Y]])
+            )
+            guidance_distance = float(distance[0])
+        if (
+            self._commands_since_plan >= cfg.local_plan_period
+            or guidance_distance > 1.0
+        ):
+            self.guidance_route = _plan_guidance_route(
+                self.route, self.progress_m, state, map_stack, cfg
+            )
+            self._commands_since_plan = 0
+        reference = self.guidance_route or self.route
+        _, reference_progress_array, _ = reference.nearest(
+            np.asarray([state[X]]), np.asarray([state[Y]])
+        )
+        reference_progress = float(reference_progress_array[0])
         noise = np.zeros((cfg.samples, cfg.horizon, 2), dtype=np.float64)
         pairs = cfg.samples // 2
         velocity_noise = _smooth_noise(
@@ -222,14 +452,17 @@ class MPPI:
         controls = self.nominal[None, :, :] + noise
         controls[:, :, 0] = np.clip(controls[:, :, 0], 0.0, cfg.speed_max)
         controls[:, :, 1] = np.clip(controls[:, :, 1], -1.0, 1.0)
+        escape_controls = _escape_controls(cfg)
+        if len(escape_controls):
+            controls[-len(escape_controls) :] = escape_controls
 
         trajectories = rollout(state, controls, self.model, cfg.dt)
         driven = trajectories[:, 1:]
-        cross_track, progress, path_yaw = self.route.nearest(
+        cross_track, progress, path_yaw = reference.nearest(
             driven[:, :, X],
             driven[:, :, Y],
-            max(0.0, self.progress_m - 0.5),
-            self.progress_m + cfg.speed_max * cfg.horizon * cfg.dt + 5.0,
+            max(0.0, reference_progress - 0.5),
+            reference_progress + cfg.speed_max * cfg.horizon * cfg.dt + 5.0,
         )
         costs = cfg.route_weight * np.sum(cross_track**2, axis=1)
         costs += cfg.heading_weight * np.sum(
@@ -251,6 +484,18 @@ class MPPI:
         )
         costs += cfg.map_cost_weight * np.sum(map_cost, axis=1)
         hard_collision = np.any(map_collision, axis=1)
+        _, initial_collision = map_stack.cost(
+            np.asarray([state[X]]), np.asarray([state[Y]])
+        )
+        escaping_overlap = bool(initial_collision[0])
+        if escaping_overlap:
+            # Stopping cannot resolve a collision the rover is already in.
+            # Prefer the rollout that sheds collision exposure fastest, even
+            # when the occupied patch extends beyond this three-second
+            # horizon. This exception is never active when the footprint is
+            # currently clear.
+            hard_collision = np.zeros(cfg.samples, dtype=bool)
+            costs += cfg.obstacle_cost * np.sum(map_collision, axis=1)
         costs += hard_collision * cfg.collision_cost
 
         if lidar_points.size:
@@ -264,6 +509,18 @@ class MPPI:
             lidar_collision = np.any(clearance < 0.18, axis=1)
             hard_collision |= lidar_collision
             costs += lidar_collision * cfg.collision_cost
+
+        # A collision-free stop immediately before an obstacle used to beat
+        # every detour: it has no collision cost and stays exactly on route.
+        # If this population contains a collision-free rollout that makes
+        # meaningful route progress, do not let stationary rollouts form that
+        # local minimum. If no such rollout exists, stopping remains available.
+        progress_gain = progress[:, -1] - reference_progress
+        moving_safe = (~hard_collision) & (
+            progress_gain >= cfg.minimum_safe_progress_m
+        )
+        if np.any(moving_safe):
+            costs += (~hard_collision & ~moving_safe) * cfg.collision_cost
 
         if np.all(hard_collision):
             self.previous.fill(0.0)

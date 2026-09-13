@@ -265,12 +265,13 @@ A drag that lands the rover in the next bush has not helped it. These routes
 thread dense vegetation — Route-11 has 255 collision sites within 0.8 m of its
 own path — so the harness loads the baked vegetation collision mesh into a
 0.25 m occupancy grid (cached at `runtime/obstacle_cells.npy`) and walks forward
-along the route until it finds a spot with a body-width of clearance and
-drivable grade. Measured against deliberately wedged rovers at real obstacle
-sites: a fixed 3 m hop freed 9/19 (47%), clearance-aware placement freed 17/20
-on Route-11 and 15/17 on the held-out Route-12 (**86% combined**). In a full
-campaign the in-situ rate is lower, around 72%, because repeated drags in one
-bad patch each count separately.
+along the route and then laterally beside it until it finds a spot with a
+body-width of clearance and drivable grade; it never silently falls back to an
+occupied target. The earlier forward-only clearance search freed 17/20 wedged
+rovers on Route-11 and 15/17 on the held-out Route-12 (86% combined), versus
+9/19 for a fixed 3 m hop. The lateral search covers the remaining failure mode:
+a long occupied centerline belt with clear ground beside it. The Route-11 seed
+7 validation resolved all 5 interventions and completed the route.
 
 ### Running many campaigns at once
 

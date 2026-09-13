@@ -249,6 +249,7 @@ class MapStack:
     aerial: UavMap | None = None
     terrain: TerrainMap | None = None
     ground_obstacles: LocalGridMap | None = None
+    ground_obstacle_probability: LocalGridMap | None = None
     ground_semantics: LocalGridMap | None = None
     ground_semantic_obstacles: LocalGridMap | None = None
     collision_probability: float = 0.65
@@ -267,14 +268,14 @@ class MapStack:
         # collision signal in this simulator.
         for dx, dy in (
             (0.0, 0.0),
-            (-0.1125, 0.0),
-            (0.1125, 0.0),
-            (0.0, -0.1125),
-            (0.0, 0.1125),
-            (-0.0875, -0.0875),
-            (-0.0875, 0.0875),
-            (0.0875, -0.0875),
-            (0.0875, 0.0875),
+            (-0.225, 0.0),
+            (0.225, 0.0),
+            (0.0, -0.225),
+            (0.0, 0.225),
+            (-0.16, -0.16),
+            (-0.16, 0.16),
+            (0.16, -0.16),
+            (0.16, 0.16),
         ):
             sample_x, sample_y = x + dx, y + dy
             if self.ground_semantics is not None:
@@ -302,6 +303,14 @@ class MapStack:
                     total_cost, np.where(valid & (cells == 50), 3.0, 0.0)
                 )
                 collision |= valid & (cells == 100)
+            if self.ground_obstacle_probability is not None:
+                probability, valid = self.ground_obstacle_probability.sample(
+                    sample_x, sample_y
+                )
+                known = valid & np.isfinite(probability)
+                total_cost = np.maximum(
+                    total_cost, np.where(known, 4.0 * probability, 0.0)
+                )
             if self.aerial is not None:
                 cost, obstacle, _, valid = self.aerial.sample(sample_x, sample_y)
                 total_cost = np.maximum(

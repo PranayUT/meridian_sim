@@ -41,6 +41,11 @@ class AssistanceManager:
         return self.mode == "counterfactual_uav" and self.state in {"waiting", "exhausted"}
 
     def reload_map(self) -> bool:
+        # Ground-only trials must remain ground-only even if a UAV result from
+        # an earlier campaign is still present at the configured path.
+        if self.mode == "ground_only":
+            self.map_stack.aerial = None
+            return False
         try:
             stat = self.map_path.stat()
         except FileNotFoundError:

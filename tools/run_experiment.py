@@ -199,7 +199,9 @@ def is_clear(cells: set[tuple[int, int]], terrain: TerrainMap | None,
 def drag_target(route: Route, xy: tuple[float, float], drag_m: float,
                 cells: set[tuple[int, int]] | None = None,
                 terrain: TerrainMap | None = None,
-                search_m: float = 20.0) -> tuple[float, float, float]:
+                search_m: float = 20.0,
+                lateral_search_m: float = 4.0,
+                progress_m: float | None = None) -> tuple[float, float, float, float]:
     """A pose at least drag_m further along the route, facing the route tangent.
 
     Two reasons not to drag straight at the next waypoint: that bearing usually
@@ -207,24 +209,44 @@ def drag_target(route: Route, xy: tuple[float, float], drag_m: float,
     vegetation, so a fixed hop lands in the next bush about half the time.
     Following the route arc and skipping past occupied ground fixes both.
     """
-    distances = np.hypot(route.xy[:, 0] - xy[0], route.xy[:, 1] - xy[1])
-    progress = float(route.distance[int(np.argmin(distances))])
+    if progress_m is None:
+        distances = np.hypot(route.xy[:, 0] - xy[0], route.xy[:, 1] - xy[1])
+        progress = float(route.distance[int(np.argmin(distances))])
+    else:
+        progress = progress_m
 
-    def pose_at(offset: float) -> tuple[float, float, float]:
+    def pose_at(offset: float) -> tuple[float, float, float, float]:
         index = int(np.searchsorted(route.distance, progress + offset))
         index = min(index, len(route.distance) - 1)
-        return float(route.xy[index, 0]), float(route.xy[index, 1]), float(route.yaw[index])
+        return (
+            float(route.xy[index, 0]),
+            float(route.xy[index, 1]),
+            float(route.yaw[index]),
+            float(route.distance[index]),
+        )
 
     fallback = pose_at(drag_m)
     if cells is None:
         return fallback
+    lateral_offsets = [0.0]
+    lateral = OBSTACLE_CELL_M * 2.0
+    while lateral <= lateral_search_m:
+        lateral_offsets.extend((lateral, -lateral))
+        lateral += OBSTACLE_CELL_M * 2.0
     offset = drag_m
     while offset <= drag_m + search_m:
-        x, y, yaw = pose_at(offset)
-        if is_clear(cells, terrain, x, y):
-            return x, y, yaw
+        x, y, yaw, target_progress = pose_at(offset)
+        normal_x, normal_y = -math.sin(yaw), math.cos(yaw)
+        for lateral_offset in lateral_offsets:
+            candidate_x = x + lateral_offset * normal_x
+            candidate_y = y + lateral_offset * normal_y
+            if is_clear(cells, terrain, candidate_x, candidate_y):
+                return candidate_x, candidate_y, yaw, target_progress
         offset += OBSTACLE_CELL_M * 2.0
-    return fallback
+    raise RuntimeError(
+        f"no clear drag target within {search_m:g} m along and "
+        f"{lateral_search_m:g} m beside the route"
+    )
 
 
 def run_trial(
@@ -264,6 +286,7 @@ def run_trial(
     resolved = 0
     pending_drag = False
     outcome = "timeout"
+    route_progress_m = 0.0
     with log_path.open("w", encoding="utf-8") as log:
         node = subprocess.Popen(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
         try:
@@ -278,6 +301,15 @@ def run_trial(
                 sim_s, xy, z, yaw, path_m = watcher.snapshot()
                 if xy is None:
                     continue
+                _, measured_progress, _ = route.nearest(
+                    np.asarray([xy[0]]),
+                    np.asarray([xy[1]]),
+                    max(0.0, route_progress_m - 0.5),
+                    min(route.distance[-1], route_progress_m + 8.0),
+                )
+                route_progress_m = max(
+                    route_progress_m, float(measured_progress[0])
+                )
                 if math.dist(xy, (goal[0], goal[1])) <= args.arrival_radius:
                     outcome = "success"
                     break
@@ -296,13 +328,15 @@ def run_trial(
                     if interventions >= args.max_interventions:
                         outcome = "stuck"
                         break
-                    drag_x, drag_y, bearing = drag_target(
-                        route, xy, args.drag_m, cells, terrain
+                    drag_x, drag_y, bearing, drag_progress = drag_target(
+                        route, xy, args.drag_m, cells, terrain,
+                        progress_m=route_progress_m,
                     )
                     ground = terrain_height(terrain, drag_x, drag_y)
                     drag_z = (ground + args.ride_height) if ground is not None else z
                     place(drag_x, drag_y, drag_z, bearing)
                     interventions += 1
+                    route_progress_m = max(route_progress_m, drag_progress)
                     pending_drag = True
                     print(
                         f"    drag {interventions}: to ({drag_x:.1f}, {drag_y:.1f}) "

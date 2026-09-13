@@ -16,6 +16,7 @@ from autonomy.meridian_drive.ground_mapping import SemanticMapper
 from autonomy.meridian_drive.maps import LocalGridMap, MapStack, TerrainMap, load_uav_map
 from autonomy.meridian_drive.obstacle_grid_logic import SOLID, TALL, classify, rasterize_window
 from autonomy.meridian_drive.routes import load_route
+from tools.run_experiment import drag_target
 
 
 class DynamicsTests(unittest.TestCase):
@@ -52,6 +53,54 @@ class DynamicsTests(unittest.TestCase):
             command = planner.command(state, MapStack(), obstacle)
         self.assertGreater(abs(float(command[1])), 0.03)
 
+    def test_planner_drives_around_a_mapped_obstacle_instead_of_stopping(self) -> None:
+        route = Route.from_waypoints([(0.0, 0.0), (20.0, 0.0)])
+        planner = MPPI(
+            route,
+            config=MppiConfig(samples=128, horizon=60),
+            seed=7,
+        )
+        resolution = 0.25
+        grid = np.zeros((32, 40), dtype=np.int8)
+        # A one-metre body centered on the route, with open ground on both
+        # sides. The old population converged to x=2.38 and stayed there.
+        grid[14:19, 14:18] = SOLID
+        stack = MapStack(
+            ground_obstacles=LocalGridMap(
+                grid, -1.0, -4.0, resolution
+            )
+        )
+        state = np.zeros(5, dtype=np.float64)
+        maximum_lateral_offset = 0.0
+        for _ in range(240):
+            command = planner.command(state, stack, np.empty((0, 2)))
+            state = rollout(
+                state, command.reshape(1, 1, 2), planner.model, planner.config.dt
+            )[0, 1]
+            maximum_lateral_offset = max(
+                maximum_lateral_offset, abs(float(state[1]))
+            )
+        self.assertGreater(float(state[0]), 4.0)
+        self.assertGreater(maximum_lateral_offset, 0.4)
+
+    def test_planner_drives_out_when_current_footprint_is_already_occupied(self) -> None:
+        route = Route.from_waypoints([(0.0, 0.0), (10.0, 0.0)])
+        planner = MPPI(route, config=MppiConfig(samples=128, horizon=60), seed=7)
+        grid = np.zeros((16, 24), dtype=np.int8)
+        grid[7:9, 3:5] = SOLID
+        stack = MapStack(
+            ground_obstacles=LocalGridMap(grid, -1.0, -2.0, 0.25)
+        )
+        state = np.zeros(5, dtype=np.float64)
+        _, collision = stack.cost(state[None, 0], state[None, 1])
+        self.assertTrue(bool(collision[0]))
+        for _ in range(40):
+            command = planner.command(state, stack, np.empty((0, 2)))
+            state = rollout(
+                state, command.reshape(1, 1, 2), planner.model, planner.config.dt
+            )[0, 1]
+        self.assertGreater(float(state[0]), 0.5)
+
     def test_route_11_projects_to_terrain_coordinates(self) -> None:
         path = Path(__file__).resolve().parents[2] / "paths" / "Route 11.kmz"
         points = load_route(path)
@@ -59,6 +108,17 @@ class DynamicsTests(unittest.TestCase):
         self.assertAlmostEqual(points[0][0], -8.802, places=2)
         self.assertAlmostEqual(points[0][1], -94.620, places=2)
         self.assertTrue(all(abs(x) <= 256.0 and abs(y) <= 256.0 for x, y in points))
+
+    def test_drag_target_keeps_monotonic_progress_at_route_crossing(self) -> None:
+        route = Route.from_waypoints(
+            [(0.0, 0.0), (10.0, 0.0), (0.0, 0.0), (10.0, 0.0)]
+        )
+        x, y, _, progress = drag_target(
+            route, (0.0, 0.0), 3.0, progress_m=20.0
+        )
+        self.assertAlmostEqual(x, 3.0)
+        self.assertAlmostEqual(y, 0.0)
+        self.assertAlmostEqual(progress, 23.0)
 
 
 class ClassifierTests(unittest.TestCase):
@@ -123,6 +183,19 @@ class MapTests(unittest.TestCase):
         cost, collision = stack.cost(np.asarray([0.5, 1.5, 2.5]), np.asarray([0.5] * 3))
         self.assertEqual(cost.tolist(), [0.0, 3.0, 0.0])
         self.assertEqual(collision.tolist(), [False, False, True])
+
+    def test_ground_occupancy_probability_is_a_soft_planner_cost(self) -> None:
+        probability = np.asarray([[0.1, 0.7, np.nan]], dtype=np.float32)
+        stack = MapStack(
+            ground_obstacle_probability=LocalGridMap(
+                probability, 0.0, 0.0, 1.0
+            )
+        )
+        cost, collision = stack.cost(
+            np.asarray([0.5, 1.5, 2.5]), np.asarray([0.5] * 3)
+        )
+        self.assertGreater(float(cost[1]), float(cost[0]))
+        self.assertEqual(collision.tolist(), [False, False, False])
 
     def test_perfect_camera_labels_project_to_semantic_cost(self) -> None:
         mapper = SemanticMapper()
@@ -234,6 +307,29 @@ class MapTests(unittest.TestCase):
             manager.update(0.0, None)
             self.assertFalse(manager.hold)
             self.assertEqual(manager.map_stack.aerial.sequence, 1)
+
+    def test_ground_only_never_loads_a_stale_uav_map(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            map_path = root / "map.npz"
+            np.savez_compressed(
+                map_path,
+                cost=np.zeros((2, 2), dtype=np.float32),
+                obstacle=np.ones((2, 2), dtype=np.float32),
+                uncertainty=np.zeros((2, 2), dtype=np.float32),
+                origin_xy=np.asarray((0.0, 0.0)),
+                resolution=np.asarray(1.0),
+            )
+            stack = MapStack()
+            manager = AssistanceManager(
+                "ground_only",
+                map_path,
+                root / "request.json",
+                root / "status.json",
+                stack,
+            )
+            self.assertIsNone(stack.aerial)
+            self.assertFalse(manager.reload_map())
 
 
 if __name__ == "__main__":
