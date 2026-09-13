@@ -305,7 +305,10 @@ hardware.
 
 Everything a run writes goes to `runtime/experiments/<run-id>/`: the campaign
 CSV, one autonomy log per trial, the Gazebo log, and that run's ground map and
-status files. `--run-id` names it and defaults to a timestamp.
+status files. `--run-id` names it and defaults to a timestamp. A `--run-id` may
+contain one `/` to nest a trial under a campaign directory, which is how
+`run_campaign.sh` groups its trials; the Gazebo partition flattens the `/` to
+an underscore.
 
 ### Drag placement
 
@@ -335,6 +338,12 @@ That is 5 rounds x 3 routes x 2 directions = 30 trials, four simulators at a
 time. Round `r` uses seed `--seed + r` (default 7). Every (round, route,
 direction) is an independent trial with its own simulator, so rounds overlap
 and a slow route never holds up the rest of its round.
+
+One invocation writes one directory. Every trial lands in
+`runtime/experiments/<campaign>/s<seed>_<route>_<direction>/`, alongside a
+`failures.txt` listing any trial that did not finish (removed when none did),
+so a campaign is a single thing to inspect, archive, or delete. `--campaign`
+names the directory and defaults to a timestamp.
 
 Each round's obstacles are baked by `tools/make_vegetation.py` into
 `runtime/vegetation/seed-<n>/`, from the painted masks in
@@ -376,6 +385,8 @@ larger box should scale until GPU sensor rendering saturates. Give each run a
 different `--seed` or the cycles will repeat the same trials.
 
 `tools/summarize_experiments.py` pools every `runtime/experiments/*/campaign.csv`
-and reports success rate, achieved speed-up, per-route means, the path-length
-to route-length ratio, intervention counts, and a list of failures. Pass
-explicit paths to summarise a subset.
+and `runtime/experiments/*/*/campaign.csv`, so it picks up both standalone runs
+and campaign directories. It reports success rate, achieved speed-up, per-route
+means, the path-length to route-length ratio, intervention counts, and a list of
+failures. Pass explicit paths to summarise a subset, such as
+`runtime/experiments/<campaign>/*/campaign.csv` for one campaign.

@@ -89,14 +89,23 @@ if [[ ! "${CAMPAIGN}" =~ ^[A-Za-z0-9._-]+$ ]]; then
   exit 2
 fi
 
+# Job control puts every trial in its own process group. A signal can then be
+# aimed at a whole trial - harness, planner, and simulator together - instead of
+# reaching only the script that launched it.
+set -m
+
 VEG_DIR="${PROJECT_ROOT}/runtime/vegetation"
-FAILURES="${PROJECT_ROOT}/runtime/experiments/${CAMPAIGN}_failures.txt"
-mkdir -p "${VEG_DIR}" "$(dirname "${FAILURES}")"
+# One directory per invocation: every trial of this campaign is a subdirectory
+# of it, so a run is a single thing to inspect, archive, or delete.
+CAMPAIGN_DIR="${PROJECT_ROOT}/runtime/experiments/${CAMPAIGN}"
+FAILURES="${CAMPAIGN_DIR}/failures.txt"
+mkdir -p "${VEG_DIR}" "${CAMPAIGN_DIR}"
 : >"${FAILURES}"
 
 TRIALS=$((ROUNDS * ${#ROUTES[@]} * ${#DIRECTIONS[@]}))
 echo "campaign ${CAMPAIGN}: ${ROUNDS} round(s) x ${#ROUTES[@]} route(s) x ${#DIRECTIONS[@]} direction(s)"
 echo "${TRIALS} trials, ${JOBS} simulator(s) at once, ${RTF}x each, seeds ${SEED}..$((SEED + ROUNDS - 1))"
+echo "results under ${CAMPAIGN_DIR}"
 
 # Bake every round's obstacles before dispatching anything. Routes in a round
 # share one variant, so building up front keeps two of that round's trials from
@@ -111,22 +120,73 @@ for ((round = 0; round < ROUNDS; round++)); do
 done
 echo "vegetation on disk: $(du -sh "${VEG_DIR}" | cut -f1) under ${VEG_DIR}"
 
+# Ctrl+C must not leave simulators behind: an orphaned gz sim holds a core and
+# keeps its partition claimed long after the campaign is gone. Signal every
+# trial group, give each run_experiment.sh time to stop its own simulator, then
+# insist, and sweep any simulator whose harness died before it could clean up.
+sweep_sims() {
+  local pid_file pid
+  for pid_file in "${CAMPAIGN_DIR}"/*/sim.pid; do
+    [[ -e "${pid_file}" ]] || continue
+    pid="$(cat "${pid_file}" 2>/dev/null || true)"
+    [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+    kill -0 "${pid}" 2>/dev/null || continue
+    # Confirm it is still a simulator: pids get reused, and this sends SIGKILL.
+    [[ "$(ps -o args= -p "${pid}" 2>/dev/null)" == *"gz sim"* ]] || continue
+    kill -KILL "${pid}" 2>/dev/null || true
+    rm -f "${pid_file}"
+  done
+}
+
+shutdown() {
+  trap - INT TERM
+  local pgid pgids alive
+  echo
+  echo "interrupted: stopping trials and their simulators"
+  pgids="$(jobs -pr)"
+  # Take the job list first, then leave monitor mode: bash would otherwise
+  # announce each terminated job by echoing the raw run_trial invocation.
+  set +m
+  for pgid in ${pgids}; do
+    kill -TERM -"${pgid}" 2>/dev/null || kill -TERM "${pgid}" 2>/dev/null || true
+  done
+  for _ in $(seq 1 60); do
+    alive=0
+    for pgid in ${pgids}; do
+      kill -0 -"${pgid}" 2>/dev/null && alive=1
+    done
+    ((alive)) || break
+    sleep 0.5
+  done
+  for pgid in ${pgids}; do
+    kill -KILL -"${pgid}" 2>/dev/null || kill -KILL "${pgid}" 2>/dev/null || true
+  done
+  sweep_sims
+  # pgrep prints 0 and exits non-zero when nothing matches, so a `|| echo 0`
+  # fallback would report the count twice.
+  local still
+  still="$(pgrep -cf '^gz sim ' 2>/dev/null)" || still=0
+  echo "stopped; ${still} simulator(s) from any campaign still up"
+  exit 130
+}
+trap shutdown INT TERM
+
 run_trial() {
-  local run_id="$1" route="$2" direction="$3" seed="$4" veg_root="$5"
-  local run_dir="${PROJECT_ROOT}/runtime/experiments/${run_id}"
+  local trial="$1" route="$2" direction="$3" seed="$4" veg_root="$5"
+  local run_dir="${CAMPAIGN_DIR}/${trial}"
   mkdir -p "${run_dir}"
-  echo "$(date +%H:%M:%S) start ${run_id}"
+  echo "$(date +%H:%M:%S) start ${trial}"
   if "${PROJECT_ROOT}/scripts/run_experiment.sh" \
-      --run-id "${run_id}" --rtf "${RTF}" --veg-root "${veg_root}" \
+      --run-id "${CAMPAIGN}/${trial}" --rtf "${RTF}" --veg-root "${veg_root}" \
       --routes "${route}" --directions "${direction}" \
       --cycles 1 --seed "${seed}" --veg-seed "${seed}" \
       --assistance "${ASSISTANCE}" --uav-uncertainty-threshold "${UAV_THRESHOLD}" \
       --mapping-uncertainty-maturity "${MAPPING_MATURITY}" \
       >"${run_dir}/campaign.log" 2>&1; then
-    echo "$(date +%H:%M:%S) done  ${run_id}"
+    echo "$(date +%H:%M:%S) done  ${trial}"
   else
-    echo "$(date +%H:%M:%S) FAILED ${run_id} (see ${run_dir}/campaign.log)"
-    echo "${run_id}" >>"${FAILURES}"
+    echo "$(date +%H:%M:%S) FAILED ${trial} (see ${run_dir}/campaign.log)"
+    echo "${trial}" >>"${FAILURES}"
   fi
 }
 
@@ -137,7 +197,7 @@ for ((round = 0; round < ROUNDS; round++)); do
       while (($(jobs -pr | wc -l) >= JOBS)); do
         wait -n
       done
-      run_trial "${CAMPAIGN}_s${seed}_${route}_${direction}" \
+      run_trial "s${seed}_${route}_${direction}" \
         "${route}" "${direction}" "${seed}" "${VEG_DIR}/seed-${seed}" &
     done
   done
@@ -155,4 +215,4 @@ fi
 
 echo
 python "${PROJECT_ROOT}/tools/summarize_experiments.py" \
-  "${PROJECT_ROOT}/runtime/experiments/${CAMPAIGN}_"*/campaign.csv
+  "${CAMPAIGN_DIR}"/*/campaign.csv

@@ -81,13 +81,16 @@ if [[ -n "${VEG_ROOT}" ]]; then
   HARNESS_ARGS+=(--veg-root "${VEG_ROOT}")
 fi
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)_$$}"
-if [[ ! "${RUN_ID}" =~ ^[A-Za-z0-9._-]+$ ]]; then
-  echo "--run-id may only contain letters, digits, dot, dash, and underscore" >&2
+# A single "/" is allowed so a campaign can nest its trials under one
+# directory; every other character is restricted as before.
+if [[ ! "${RUN_ID}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)?$ ]]; then
+  echo "--run-id may only contain letters, digits, dot, dash, underscore," \
+       "and at most one / to nest a trial under a campaign" >&2
   exit 2
 fi
 # One Gazebo bus per campaign, so several can share a machine without their
 # topics, services, or set_pose calls reaching each other.
-export GZ_PARTITION="${GZ_PARTITION:-rugged_ugv_${RUN_ID}}"
+export GZ_PARTITION="${GZ_PARTITION:-rugged_ugv_${RUN_ID//\//_}}"
 if [[ ! "${RTF}" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ "${RTF}" == 0 ]]; then
   echo "--rtf needs a positive number, for example --rtf 3" >&2
   exit 2
@@ -96,10 +99,45 @@ fi
 SIM_LOG="${PROJECT_ROOT}/runtime/experiments/${RUN_ID}/gazebo.log"
 mkdir -p "$(dirname "${SIM_LOG}")"
 SIM_PID=""
-cleanup() {
-  [[ -z "${SIM_PID}" ]] || kill "${SIM_PID}" 2>/dev/null || true
+SIM_PID_FILE="${PROJECT_ROOT}/runtime/experiments/${RUN_ID}/sim.pid"
+
+# gz sim does not reliably stop on SIGTERM, and a simulator that outlives its
+# harness holds a core and keeps its partition claimed. Ask, wait, then insist,
+# and do not return until the process is actually gone.
+stop_sim() {
+  [[ -n "${SIM_PID}" ]] || return 0
+  kill -0 "${SIM_PID}" 2>/dev/null || return 0
+  kill -TERM "${SIM_PID}" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    kill -0 "${SIM_PID}" 2>/dev/null || break
+    sleep 0.5
+  done
+  if kill -0 "${SIM_PID}" 2>/dev/null; then
+    kill -KILL "${SIM_PID}" 2>/dev/null || true
+  fi
+  wait "${SIM_PID}" 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM
+
+on_exit() {
+  local status=$?
+  trap - EXIT INT TERM
+  stop_sim
+  rm -f "${SIM_PID_FILE}"
+  exit "${status}"
+}
+
+# Ctrl+C reaches the whole process group, so the simulator and the planner are
+# already on their way down; this still waits for the simulator so the trial
+# never outlives the script that started it.
+on_signal() {
+  trap - EXIT INT TERM
+  stop_sim
+  rm -f "${SIM_PID_FILE}"
+  exit 130
+}
+
+trap on_exit EXIT
+trap on_signal INT TERM
 
 SIM_FLAGS=(-r -z "$(awk -v r="${RTF}" 'BEGIN { printf "%d", r / 0.001 }')")
 if [[ "${GUI}" == false ]]; then
@@ -114,6 +152,8 @@ echo "Starting Gazebo at ${RTF}x (log: ${SIM_LOG})"
 gz sim --force-version 8 "${SIM_FLAGS[@]}" \
   "${PROJECT_ROOT}/worlds/hill_country.sdf" >"${SIM_LOG}" 2>&1 &
 SIM_PID=$!
+# Recorded so a campaign can sweep for simulators whose harness died outright.
+echo "${SIM_PID}" >"${SIM_PID_FILE}"
 
 for _ in $(seq 1 60); do
   if gz topic -l 2>/dev/null | grep -q "/world/hill_country/dynamic_pose/info"; then

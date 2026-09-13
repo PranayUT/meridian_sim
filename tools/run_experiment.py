@@ -100,13 +100,26 @@ class RoverWatcher:
             return self.sim_s, self.xy, self.z, self.yaw, self.path_m
 
 
-def gz_service(service: str, request: str, reqtype: str, timeout_ms: int = 3000) -> bool:
-    result = subprocess.run(
-        ["gz", "service", "-s", service, "--reqtype", reqtype,
-         "--reptype", "gz.msgs.Boolean", "--timeout", str(timeout_ms), "--req", request],
-        capture_output=True, text=True,
-    )
-    return "data: true" in result.stdout
+def gz_service(service: str, request: str, reqtype: str, timeout_ms: int = 10000,
+               attempts: int = 4) -> bool:
+    """Call a Gazebo service, retrying while the bus is busy.
+
+    When a campaign starts, every trial boots a simulator and reaches for this
+    bus at the same moment, and discovery alone can outlast a short timeout. A
+    reply that is merely late is not a failed trial, so back off and ask again.
+    """
+    for attempt in range(attempts):
+        result = subprocess.run(
+            ["gz", "service", "-s", service, "--reqtype", reqtype,
+             "--reptype", "gz.msgs.Boolean", "--timeout", str(timeout_ms),
+             "--req", request],
+            capture_output=True, text=True,
+        )
+        if "data: true" in result.stdout:
+            return True
+        if attempt + 1 < attempts:
+            time.sleep(2.0 * (attempt + 1))
+    return False
 
 
 def reset_world() -> bool:
@@ -265,12 +278,18 @@ def run_trial(
     start = anchors[0]
     heading = math.atan2(anchors[1][1] - start[1], anchors[1][0] - start[0])
 
-    reset_world()
+    if not reset_world():
+        # Worth saying out loud: a reset that never landed leaves the previous
+        # trial's world in place, which quietly changes what this trial measures.
+        print("    warning: world reset did not confirm; continuing", flush=True)
     time.sleep(1.0)
     height = terrain_height(terrain, start[0], start[1])
     start_z = (height + args.ride_height) if height is not None else args.fallback_z
     if not place(start[0], start[1], start_z, heading):
-        raise SystemExit("set_pose failed; is the simulator running?")
+        raise SystemExit(
+            "set_pose failed after retries; the simulator is up but its service "
+            "bus never answered. Lower --jobs so fewer simulators start at once."
+        )
     time.sleep(1.5)
     watcher.reset()
 

@@ -9,10 +9,29 @@ import statistics
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_GLOB = "runtime/experiments/*/campaign.csv"
+# A standalone run writes runtime/experiments/<run-id>/, while a campaign nests
+# its trials one level deeper under runtime/experiments/<campaign>/. Pick up
+# both so the default still pools everything on disk.
+DEFAULT_GLOBS = ("runtime/experiments/*/campaign.csv",
+                 "runtime/experiments/*/*/campaign.csv")
 
 NUMERIC = ("sim_time_s", "wall_time_s", "path_length_m", "route_length_m",
            "interventions", "interventions_resolved", "success", "cycle", "seed")
+
+
+def run_label(path: Path) -> str:
+    """Name a trial by its path under runtime/experiments.
+
+    A campaign trial reads as "<campaign>/<trial>" and a standalone run as
+    just "<run-id>", so pooled output says which campaign a row came from.
+    """
+    experiments = ROOT / "runtime" / "experiments"
+    try:
+        # Resolve first: paths given on the command line are usually relative,
+        # and relative_to would miss the campaign directory without this.
+        return path.resolve().parent.relative_to(experiments).as_posix()
+    except ValueError:
+        return path.parent.name
 
 
 def load(paths: list[Path]) -> list[dict]:
@@ -23,7 +42,7 @@ def load(paths: list[Path]) -> list[dict]:
                 for key in NUMERIC:
                     if row.get(key):
                         row[key] = float(row[key])
-                row["run"] = path.parent.name
+                row["run"] = run_label(path)
                 rows.append(row)
     return rows
 
@@ -35,13 +54,21 @@ def mean(values: list[float]) -> float:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("paths", nargs="*", type=Path,
-                        help=f"campaign CSVs; defaults to {DEFAULT_GLOB}")
+                        help="campaign CSVs; defaults to "
+                             + " and ".join(DEFAULT_GLOBS))
     args = parser.parse_args()
 
-    paths = args.paths or sorted(ROOT.glob(DEFAULT_GLOB))
+    if args.paths:
+        paths = args.paths
+    else:
+        found: set[Path] = set()
+        for pattern in DEFAULT_GLOBS:
+            found.update(ROOT.glob(pattern))
+        paths = sorted(found)
     paths = [p for p in paths if p.is_file()]
     if not paths:
-        raise SystemExit(f"no campaign CSVs found under {ROOT / DEFAULT_GLOB}")
+        raise SystemExit("no campaign CSVs found under "
+                         + " or ".join(str(ROOT / g) for g in DEFAULT_GLOBS))
     rows = load(paths)
     if not rows:
         raise SystemExit("campaign CSVs contain no trials")
