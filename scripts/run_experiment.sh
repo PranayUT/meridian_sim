@@ -18,10 +18,11 @@ if [[ ! -f "${PROJECT_ROOT}/models/hill_terrain/meshes/terrain.tif" ]]; then
   python "${PROJECT_ROOT}/tools/generate_terrain.py"
 fi
 
-# --rtf, --gui, and --run-id belong here; everything else goes to the harness.
+# --rtf, --gui, --run-id, and --veg-root belong here; the rest go to the harness.
 RTF="3"
 GUI=false
 RUN_ID=""
+VEG_ROOT=""
 HARNESS_ARGS=()
 ARGS=("$@")
 index=0
@@ -48,6 +49,16 @@ while ((index < ${#ARGS[@]})); do
       ((index += 1))
       continue
       ;;
+    --veg-root)
+      VEG_ROOT="${ARGS[index + 1]:-}"
+      ((index += 2))
+      continue
+      ;;
+    --veg-root=*)
+      VEG_ROOT="${argument#--veg-root=}"
+      ((index += 1))
+      continue
+      ;;
     --gui)
       GUI=true
       ((index += 1))
@@ -57,6 +68,18 @@ while ((index < ${#ARGS[@]})); do
   HARNESS_ARGS+=("${argument}")
   ((index += 1))
 done
+# The variant has to go ahead of models/ so model://painted_vegetation resolves
+# to this run's obstacles, and the harness has to grade drags against the same
+# mesh, so it is both an environment entry and a harness argument.
+if [[ -n "${VEG_ROOT}" ]]; then
+  if [[ ! -d "${VEG_ROOT}/painted_vegetation" ]]; then
+    echo "no painted_vegetation under ${VEG_ROOT}; build it with tools/make_vegetation.py" >&2
+    exit 2
+  fi
+  VEG_ROOT="$(cd "${VEG_ROOT}" && pwd)"
+  export GZ_SIM_RESOURCE_PATH="${VEG_ROOT}:${GZ_SIM_RESOURCE_PATH}"
+  HARNESS_ARGS+=(--veg-root "${VEG_ROOT}")
+fi
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)_$$}"
 if [[ ! "${RUN_ID}" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "--run-id may only contain letters, digits, dot, dash, and underscore" >&2

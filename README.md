@@ -273,11 +273,44 @@ rovers on Route-11 and 15/17 on the held-out Route-12 (86% combined), versus
 a long occupied centerline belt with clear ground beside it. The Route-11 seed
 7 validation resolved all 5 interventions and completed the route.
 
+### Rounds with randomised obstacles
+
+`scripts/run_campaign.sh` is the batch entry point. It sweeps rounds, and a
+round is one seed used for both the obstacles and the planner across every
+route, so a route's variation between rounds is variation in both:
+
+```bash
+./scripts/run_campaign.sh --rounds 5 --jobs 4 --rtf 3
+```
+
+That is 5 rounds x 3 routes x 2 directions = 30 trials, four simulators at a
+time. Round `r` uses seed `--seed + r` (default 7). Every (round, route,
+direction) is an independent trial with its own simulator, so rounds overlap
+and a slow route never holds up the rest of its round.
+
+Each round's obstacles are baked by `tools/make_vegetation.py` into
+`runtime/vegetation/seed-<n>/`, from the painted masks in
+`maps/vegetation_paint.npz`. The painted regions, the plant lattice, and the
+plant counts are fixed; the seed only drives per-plant jitter, scale, and yaw.
+Between two seeds the 1,307 bushes and trees keep their count and move a median
+0.30 m (p90 0.72 m), which is enough to open or close a marginal gap without
+moving where the route is drivable. Baking a variant takes about 4 seconds and
+167 MB, and an existing one is reused rather than rebuilt.
+
+The variant directory goes on `GZ_SIM_RESOURCE_PATH` ahead of `models/`, so
+`model://painted_vegetation` resolves to that round's obstacles without editing
+the world, and campaigns with different obstacles can share a machine. The
+harness grades its drag targets against the same variant's collision mesh, with
+the occupancy grid cached per variant — pointing it at the wrong mesh would aim
+the rover at cells another round left clear. Each trial's `veg_seed` column
+records which variant it drove.
+
 ### Running many campaigns at once
 
 Each campaign gets its own `GZ_PARTITION` (derived from the run id), so several
 can share a machine without their topics, services, or `set_pose` calls
-reaching each other:
+reaching each other. `run_campaign.sh` relies on this, and
+`scripts/run_experiment.sh` can be driven the same way by hand:
 
 ```bash
 for i in 1 2 3 4; do
@@ -286,6 +319,9 @@ done
 wait
 python tools/summarize_experiments.py
 ```
+
+Pass `--veg-root runtime/vegetation/seed-<n>` to give a hand-driven campaign a
+baked variant; without it the committed `models/painted_vegetation` is used.
 
 Two concurrent campaigns each held 2.83x on the development machine, so a
 larger box should scale until GPU sensor rendering saturates. Give each run a

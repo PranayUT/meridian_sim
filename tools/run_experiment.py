@@ -50,6 +50,7 @@ class Trial:
     direction: str
     route_file: Path
     route_length_m: float
+    veg_seed: str
 
 
 class RoverWatcher:
@@ -151,19 +152,24 @@ def build_route_files(names: list[str]) -> list[tuple[str, str, Path]]:
     return entries
 
 
-OBSTACLE_MESH = ROOT / "models" / "painted_vegetation" / "meshes" / "collision.obj"
+DEFAULT_OBSTACLE_MESH = ROOT / "models" / "painted_vegetation" / "meshes" / "collision.obj"
 OBSTACLE_CELL_M = 0.25
 
 
-def obstacle_cells() -> set[tuple[int, int]]:
-    """Grid cells covered by the baked vegetation collision mesh."""
-    cache = RUNTIME / "obstacle_cells.npy"
-    if cache.is_file() and cache.stat().st_mtime >= OBSTACLE_MESH.stat().st_mtime:
+def obstacle_cells(mesh: Path = DEFAULT_OBSTACLE_MESH, cache: Path | None = None) -> set[tuple[int, int]]:
+    """Grid cells covered by the baked vegetation collision mesh.
+
+    The mesh has to be the one this run's simulator loaded. A randomised
+    campaign gives each round its own variant, and grading drag targets against
+    a different round's bushes would aim the rover straight into them.
+    """
+    cache = cache or RUNTIME / "obstacle_cells.npy"
+    if cache.is_file() and mesh.is_file() and cache.stat().st_mtime >= mesh.stat().st_mtime:
         return {tuple(cell) for cell in np.load(cache)}
-    if not OBSTACLE_MESH.is_file():
+    if not mesh.is_file():
         return set()
     points = []
-    with OBSTACLE_MESH.open("r", encoding="utf-8") as handle:
+    with mesh.open("r", encoding="utf-8") as handle:
         for line in handle:
             if line.startswith("v "):
                 parts = line.split()
@@ -372,6 +378,7 @@ def run_trial(
         "route_length_m": round(trial.route_length_m, 2),
         "interventions": interventions,
         "interventions_resolved": resolved,
+        "veg_seed": trial.veg_seed,
     }
 
 
@@ -392,6 +399,11 @@ def main() -> int:
     parser.add_argument("--arrival-radius", type=float, default=0.25)
     parser.add_argument("--ride-height", type=float, default=0.25)
     parser.add_argument("--fallback-z", type=float, default=22.0)
+    parser.add_argument("--veg-root", type=Path, default=None,
+                        help="resource root holding this run's painted_vegetation variant; "
+                             "must be the same one on GZ_SIM_RESOURCE_PATH")
+    parser.add_argument("--veg-seed", default="",
+                        help="recorded per trial so a CSV says which variant it drove")
     parser.add_argument("--results", type=Path, default=None)
     parser.add_argument("--run-id", default=None,
                         help="names runtime/experiments/<id>/; defaults to a timestamp")
@@ -408,7 +420,14 @@ def main() -> int:
         raise SystemExit("no route/direction combinations selected")
     terrain_path = ROOT / "models" / "hill_terrain" / "meshes" / "terrain.tif"
     terrain = TerrainMap.from_tif(terrain_path) if terrain_path.is_file() else None
-    cells = obstacle_cells()
+    if args.veg_root is not None:
+        mesh = args.veg_root / "painted_vegetation" / "meshes" / "collision.obj"
+        if not mesh.is_file():
+            raise SystemExit(f"no vegetation variant at {mesh}; build it with tools/make_vegetation.py")
+        cells = obstacle_cells(mesh, args.veg_root / "obstacle_cells.npy")
+        print(f"vegetation variant {args.veg_root}", flush=True)
+    else:
+        cells = obstacle_cells()
     print(f"{len(cells)} obstacle cells loaded for drag placement", flush=True)
 
     node = Node()
@@ -425,7 +444,7 @@ def main() -> int:
     results_path.parent.mkdir(parents=True, exist_ok=True)
     columns = ["cycle", "seed", "route", "direction", "outcome", "success",
                "sim_time_s", "wall_time_s", "path_length_m", "route_length_m",
-               "interventions", "interventions_resolved"]
+               "interventions", "interventions_resolved", "veg_seed"]
     rows: list[dict] = []
     stop = False
 
@@ -447,7 +466,7 @@ def main() -> int:
                     break
                 waypoints = load_route(route_file)
                 length = float(Route.from_waypoints(waypoints).distance[-1])
-                trial = Trial(cycle, seed, route_name, direction, route_file, length)
+                trial = Trial(cycle, seed, route_name, direction, route_file, length, args.veg_seed)
                 print(f"[cycle {cycle} seed {seed}] {route_name} {direction} ({length:.0f} m)", flush=True)
                 row = run_trial(trial, watcher, terrain, cells, args)
                 rows.append(row)
