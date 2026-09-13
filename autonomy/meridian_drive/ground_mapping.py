@@ -70,7 +70,7 @@ class GroundMapper:
             step_height_m=0.10,
             ground_slope=0.35,
             ground_gap_m=0.75,
-            shadow_depth_m=0.75,
+            shadow_depth_m=2.0,
             classify_range_m=12.0,
         )
         direct = self.local.direct_occupancy_observation(

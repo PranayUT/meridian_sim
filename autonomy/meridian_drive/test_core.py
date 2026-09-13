@@ -14,6 +14,7 @@ from autonomy.meridian_drive.assistance import AssistanceManager
 from autonomy.meridian_drive.core import MPPI, MppiConfig, Route, VehicleModel, rollout
 from autonomy.meridian_drive.ground_mapping import SemanticMapper
 from autonomy.meridian_drive.maps import LocalGridMap, MapStack, TerrainMap, load_uav_map
+from autonomy.meridian_drive.obstacle_grid_logic import SOLID, TALL, classify, rasterize_window
 from autonomy.meridian_drive.routes import load_route
 
 
@@ -58,6 +59,61 @@ class DynamicsTests(unittest.TestCase):
         self.assertAlmostEqual(points[0][0], -8.802, places=2)
         self.assertAlmostEqual(points[0][1], -94.620, places=2)
         self.assertTrue(all(abs(x) <= 256.0 and abs(y) <= 256.0 for x, y in points))
+
+
+class ClassifierTests(unittest.TestCase):
+    """A body that shows its own ground under an overhang is still SOLID."""
+
+    RES = 0.25
+    W = H = 48
+
+    def _window(self, body_x: tuple[float, float], lit_to_x: float, shadow_to_x: float):
+        """Ground out to ``lit_to_x``, a body in ``body_x``, then nothing.
+
+        ``lit_to_x`` past the far edge of the body is the bush case: the
+        lidar sees under the overhang before the shadow starts.
+        """
+        origin = (-1.0, -3.0)
+        points = []
+        step = self.RES / 3.0
+        for x in np.arange(origin[0], origin[0] + self.W * self.RES, step):
+            for y in np.arange(-2.5, 2.5, step):
+                in_body_rows = abs(y) <= 0.5
+                if in_body_rows and body_x[0] <= x <= body_x[1]:
+                    continue  # the body hides its own ground
+                if in_body_rows and x > lit_to_x:
+                    continue  # shadow: no return at all
+                points.append((x, y, 0.0))
+        for x in np.arange(body_x[0], body_x[1], step):
+            for y in np.arange(-0.5, 0.5, step):
+                for z in np.arange(0.15, 0.70, step):
+                    points.append((x, y, z))
+        xyz = np.asarray(points, dtype=np.float64)
+        raster = rasterize_window(xyz, origin[0], origin[1], self.W, self.H, self.RES)
+        return raster, origin
+
+    def test_body_lit_beneath_its_overhang_is_still_solid(self) -> None:
+        # Ground visible 0.5 m past the body's far edge, shadow beyond that.
+        raster, origin = self._window((4.0, 5.0), lit_to_x=5.5, shadow_to_x=9.0)
+        cls = classify(
+            raster.min_z, raster.count, raster.xyz, self.RES, origin,
+            sensor_xy=(0.0, 0.0), sensor_ground_z=0.0,
+            body_band_lo_m=0.10, body_band_hi_m=0.75, body_band_returns=2,
+            shadow_depth_m=2.0,
+        )
+        self.assertIn(SOLID, cls, "a body lit under its overhang read as porous")
+
+    def test_body_with_ground_seen_well_past_it_stays_tall(self) -> None:
+        # Ground seen all the way out: a genuinely porous body, still TALL.
+        raster, origin = self._window((4.0, 5.0), lit_to_x=11.0, shadow_to_x=11.0)
+        cls = classify(
+            raster.min_z, raster.count, raster.xyz, self.RES, origin,
+            sensor_xy=(0.0, 0.0), sensor_ground_z=0.0,
+            body_band_lo_m=0.10, body_band_hi_m=0.75, body_band_returns=2,
+            shadow_depth_m=2.0,
+        )
+        self.assertIn(TALL, cls)
+        self.assertNotIn(SOLID, cls, "a body the rays saw straight through read as solid")
 
 
 class MapTests(unittest.TestCase):

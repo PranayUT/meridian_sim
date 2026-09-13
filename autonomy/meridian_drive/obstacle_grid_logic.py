@@ -95,8 +95,12 @@ false positives from 29 % to under 1 % per look inside 12 m. The 2026-09-09
 field rule lowers ``body_band_lo_m`` and ``step_height_m`` to 0.10 m so the
 map can detect rocks and ledges above about 4 in. The configured upper band is
 0.75 m. This covers the 0.5 m truck and rejects higher canopy.
-``shadow_depth_m`` = 0.75 m
-is three cells, and ``classify_range_m`` = 12 m is where a Mid-360 scan
+``shadow_depth_m`` = 2.0 m is eight cells. Three cells (0.75 m) did not
+clear the footprint of a body about a metre across: the window landed under
+the near overhang, where the ground is genuinely visible, and never reached
+the shadow past the far edge. The figure is a footprint, not a shadow depth,
+and it wants a sweep against ground truth like every other one here.
+``classify_range_m`` = 12 m is where a Mid-360 scan
 is still dense enough that an unseen cell means occlusion rather than a
 sampling gap. Nobody has driven the truck at a measured obstacle to find
 the real thresholds, and nobody has swept the shadow parameters against
@@ -636,12 +640,15 @@ def classify(
     Tall cells are TALL unless the shadow test promotes them: walk out
     along the ray from ``sensor_xy`` through the cell, skip the leading
     run of tall cells (the rest of the same body), and look at the next
-    ``shadow_depth_m`` of window. Any cell in there with its ground seen
-    and nothing standing on it is the ray having got through — porous,
-    so TALL. Otherwise, if anything in there had no ground-level return,
-    the cell cast a shadow — SOLID. A cell whose only returns are canopy
-    counts as unseen for this purpose: the ray reaching a branch behind
-    the trunk says nothing about the ground behind the trunk.
+    ``shadow_depth_m`` of window. Cells in there with their ground seen
+    and nothing standing on them are the ray having got through; cells
+    with no ground-level return are shadow. The cell is SOLID when there
+    is shadow and it is at least as much of the window as the lit cells
+    are — porosity is a reading of the window, not one cell, because a
+    body that meets the ground on a curve shows its own ground under the
+    overhang. A cell whose only returns are canopy counts as unseen for
+    this purpose: the ray reaching a branch behind the trunk says
+    nothing about the ground behind the trunk.
 
     ``sensor_xy = None`` (no odometry yet, or too stale to trust) leaves
     every tall cell TALL, as does any cell further than
@@ -774,9 +781,17 @@ def _shadow_test(
         & (ks < (first_free + k_shadow)[None, :])
         & ~all_body[None, :]
     )
-    lit = ((state == _LIT) & window).any(axis=0)
-    shadowed = ((state == _SHADOW) & window).any(axis=0)
-    out[keep] = shadowed & ~lit
+    # Porosity has to be the dominant reading of the window, not a single
+    # cell. A body whose surface curves down to meet the ground — a bush, a
+    # boulder — is widest well above the band and tapers to nothing at z=0,
+    # so the lidar sees its own ground under the overhang. Those cells are
+    # lit, they sit inside the body's footprint, and under an `any()` veto
+    # one of them denied SOLID to the whole body: the 0.25 m bush window
+    # measured three lit cells under the overhang against a full shadow that
+    # only starts past the far edge.
+    lit = ((state == _LIT) & window).sum(axis=0)
+    shadowed = ((state == _SHADOW) & window).sum(axis=0)
+    out[keep] = (shadowed > 0) & (shadowed >= lit)
     return out
 
 
