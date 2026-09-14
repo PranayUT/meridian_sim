@@ -144,11 +144,13 @@ class GazeboAutonomy:
             request_handler=ground_truth_uav,
             clock=self.now,
         )
-        if args.assistance == "always_on_uav":
-            # This is an oracle-information upper bound: keep the equivalent
-            # of a 25 m local UAV view around every route point available from
-            # the first planner tick onward. Align outward to raster cells so
-            # the generated map cannot lose its far edge to rounding.
+        if args.assistance in ("explore_then_drive", "always_on_uav"):
+            # Both route-wide arms expose the same information to the UGV.
+            # explore_then_drive is charged for a sequential lawnmower survey
+            # by the campaign harness; always_on_uav remains an oracle upper
+            # bound. Keep the equivalent of a local UAV view around every
+            # route point available from the first planner tick onward. Align
+            # outward to raster cells so rounding cannot lose the far edge.
             assert ground_truth_uav is not None
             padding = args.uav_map_size / 2.0
             resolution = args.uav_resolution
@@ -165,13 +167,15 @@ class GazeboAutonomy:
                 * resolution,
             )
             # The combined product contains both evidence channels. Unlike
-            # reactive assistance, this proactive baseline has no request
-            # count, stop, wait, or fusion-settling penalty.
+            # reactive assistance, these proactive baselines have no request
+            # count, stop, wait, or fusion-settling state in the controller.
             ground_truth_uav(roi, 1, COMBINED_MAP_TYPE)
             if not self.assistance.reload_map(force=True):
-                raise RuntimeError("could not load the always-on UAV baseline map")
+                raise RuntimeError("could not load the route-wide UAV baseline map")
             self.assistance.detail = (
-                "route-wide occupancy and semantic aerial evidence loaded"
+                "route-wide occupancy and semantic aerial survey loaded"
+                if args.assistance == "explore_then_drive"
+                else "route-wide occupancy and semantic aerial evidence loaded"
             )
         # Assistance evaluation is the most expensive thing in the control
         # tick. It runs every tick by default so the counterfactual sees the
@@ -1097,8 +1101,11 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"simulated UAV semantic masks do not exist: {args.uav_semantic_masks}")
         if not args.world_file.is_file():
             parser.error(f"simulator world does not exist: {args.world_file}")
-    if args.assistance == "always_on_uav" and args.uav_source != "ground_truth":
-        parser.error("always_on_uav requires --uav-source ground_truth")
+    if args.assistance in ("explore_then_drive", "always_on_uav") \
+            and args.uav_source != "ground_truth":
+        parser.error(
+            "explore_then_drive and always_on_uav require --uav-source ground_truth"
+        )
     return args
 
 

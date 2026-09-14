@@ -165,6 +165,7 @@ Select one of the Meridian Drive experiment policies when autonomy starts:
 ./scripts/run_autonomy.sh --assistance ground_only
 ./scripts/run_autonomy.sh --assistance greedy_uav
 ./scripts/run_autonomy.sh --assistance counterfactual_uav
+./scripts/run_autonomy.sh --assistance explore_then_drive
 ./scripts/run_autonomy.sh --assistance always_on_uav
 ```
 
@@ -232,10 +233,29 @@ permits two requests for one 5 m region and source, then holds for operator
 action. Unlike the field policy's expanding retry, every simulator response
 remains exactly 25 m by 25 m.
 
+`explore_then_drive` is the naive/exhaustive baseline used in the same logical
+family as Delmerico et al. (2017) and Zhang et al. (2022): the UAV first surveys
+the whole route-relevant area, fuses the resulting traversability map, and only
+then does the UGV start. The simulator supplies the route-wide map before the
+first control tick. The experiment harness models a lawnmower flight over the
+route bounding box plus a half-swath margin and adds that flight time to the
+UGV simulator time; it does not run UAV dynamics in Gazebo.
+
 `always_on_uav` is an optimistic simulator baseline. Exact physical occupancy
 and semantic traversability covering the full route plus a 12.5 m margin are
 fused before the first control tick and remain available throughout the run.
 It makes no reactive requests and never holds the rover.
+
+UAV resource accounting is analytical. The fixed horizontal speed is 5 m/s,
+the current PX4 `MPC_XY_CRUISE` default for autonomous modes including
+missions. With the default 25 m map width, one counterfactual assist is charged
+as one map-width observation transect, or 5 seconds, so its flight time is
+`request_count * 5 s` and that service time is added to total navigation time.
+Greedy and always-on assistance are concurrent with driving, so their UAV
+flight time equals UGV navigation time and is not added again. For
+explore-then-drive, `total_navigation_time_s = uav_flight_time_s + sim_time_s`.
+Takeoff, landing, and depot transit are excluded because the experiment does
+not specify a UAV depot.
 
 For example, run Route 11 at the 20% starting point and inspect its request
 count and channel scores before changing the policy:
@@ -305,8 +325,9 @@ costs 1-2 late cycles per 100, and 5x misses about 40 per 100. Lower
 `scripts/run_experiment.sh` drives a campaign and records one CSV row per
 trial. It runs each named route forward and reversed, cycling the seed. The
 default is ground-only assistance; pass `--assistance counterfactual_uav` for
-the request-driven ground-truth UAV condition, or `--assistance always_on_uav`
-for the route-wide optimistic baseline:
+the request-driven ground-truth UAV condition, `--assistance
+explore_then_drive` for the sequential exhaustive-survey baseline, or
+`--assistance always_on_uav` for the route-wide optimistic baseline:
 
 ```bash
 ./scripts/run_experiment.sh --cycles 5 --rtf 3
@@ -331,10 +352,12 @@ usually points through whatever is wedging the rover. Interventions are applied
 from the harness, not from `gazebo_node`, so the planner under test stays the
 same code that runs against Meridian Drive.
 
-Recorded per trial: outcome, success, simulator seconds, wall seconds, distance
-driven, route length, interventions, how many of those interventions the rover
-actually drove clear of, assistance mode, uncertainty threshold, cell-maturity
-window, and UAV request count. Dividing simulator by wall seconds gives the speed-up the run
+Recorded per trial: outcome, success, UGV simulator seconds, total navigation
+seconds, analytical UAV flight seconds, UAV sorties, survey distance, the
+fixed speed and per-assist duration used, wall seconds, distance driven, route
+length, interventions, how many of those interventions the rover actually
+drove clear of, assistance mode, uncertainty threshold, cell-maturity window,
+and UAV request count. Dividing simulator by wall seconds gives the speed-up the run
 really achieved, which is the number to trust when tuning `--rtf` on new
 hardware.
 

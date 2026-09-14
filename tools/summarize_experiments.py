@@ -15,8 +15,19 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_GLOBS = ("runtime/experiments/*/campaign.csv",
                  "runtime/experiments/*/*/campaign.csv")
 
-NUMERIC = ("sim_time_s", "wall_time_s", "path_length_m", "route_length_m",
-           "interventions", "interventions_resolved", "success", "cycle", "seed")
+NUMERIC = (
+    "sim_time_s",
+    "total_navigation_time_s",
+    "uav_flight_time_s",
+    "wall_time_s",
+    "path_length_m",
+    "route_length_m",
+    "interventions",
+    "interventions_resolved",
+    "success",
+    "cycle",
+    "seed",
+)
 
 
 def run_label(path: Path) -> str:
@@ -97,16 +108,26 @@ def main() -> int:
               f"{drags / len(rows):.1f} per trial")
 
     print(f"\n{'route':<12} {'dir':<8} {'n':>4} {'succ':>6} {'sim s':>8} "
-          f"{'driven m':>9} {'ratio':>6} {'drags':>6}")
+          f"{'nav s':>8} {'UAV s':>8} {'driven m':>9} {'ratio':>6} {'drags':>6}")
     keys = sorted({(r["route"], r["direction"]) for r in rows})
     for route, direction in keys:
         subset = [r for r in rows if r["route"] == route and r["direction"] == direction]
         ok = [r for r in subset if r["success"]]
         ratio = mean([r["path_length_m"] / r["route_length_m"] for r in ok
                       if r.get("route_length_m")])
+        total_time = mean([
+            r["total_navigation_time_s"] for r in ok
+            if r.get("total_navigation_time_s") is not None
+        ])
+        uav_time = mean([
+            r["uav_flight_time_s"] for r in ok
+            if r.get("uav_flight_time_s") is not None
+        ])
         print(f"{route:<12} {direction:<8} {len(subset):>4} "
               f"{100.0 * len(ok) / len(subset):>5.0f}% "
               f"{mean([r['sim_time_s'] for r in ok]):>8.0f} "
+              f"{total_time:>8.0f} "
+              f"{uav_time:>8.0f} "
               f"{mean([r['path_length_m'] for r in ok]):>9.0f} "
               f"{ratio:>6.2f} "
               f"{mean([r['interventions'] for r in subset]):>6.1f}")

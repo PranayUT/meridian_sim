@@ -41,6 +41,10 @@ DEFAULT_ROUTES = ("Route-11", "Route-12", "Route-13")
 ROUTE_DIR = ROOT / "paths" / "from_truck"
 RUNTIME = ROOT / "runtime"
 
+# PX4 MPC_XY_CRUISE: default horizontal velocity in autonomous modes,
+# including missions when a waypoint does not specify another speed.
+PX4_MISSION_CRUISE_SPEED_MPS = 5.0
+
 
 @dataclass
 class Trial:
@@ -51,6 +55,75 @@ class Trial:
     route_file: Path
     route_length_m: float
     veg_seed: str
+
+
+def route_coverage_distance_m(route: Route, swath_m: float) -> float:
+    """Approximate an exhaustive route-area survey with a lawnmower path.
+
+    The rectangle is the same abstraction used to build the route-wide UAV
+    evidence: the route bounds padded by half a local-map width. Straight
+    survey legs run along the longer axis and adjacent legs are joined by a
+    cross-track transition. Takeoff, landing, and travel from an unspecified
+    depot are deliberately excluded.
+    """
+    if swath_m <= 0.0:
+        raise ValueError("survey swath must be positive")
+    padding = swath_m / 2.0
+    width = float(np.ptp(route.xy[:, 0])) + 2.0 * padding
+    height = float(np.ptp(route.xy[:, 1])) + 2.0 * padding
+    along_track = max(width, height)
+    across_track = min(width, height)
+    passes = max(1, math.ceil(across_track / swath_m))
+    transitions = min(across_track, (passes - 1) * swath_m)
+    return passes * along_track + transitions
+
+
+def estimate_uav_usage(
+    mode: str,
+    route: Route,
+    ugv_navigation_time_s: float,
+    request_count: int,
+    map_size_m: float,
+) -> dict[str, float | int]:
+    """Return the deliberately simple analytical UAV accounting model.
+
+    A reactive assist is one map-width observation transect at PX4 cruise
+    speed. Explore-then-drive covers the padded route rectangle before the UGV
+    begins. Greedy and always-on fly concurrently for the UGV run duration.
+    """
+    if ugv_navigation_time_s < 0.0 or request_count < 0 or map_size_m <= 0.0:
+        raise ValueError("UAV usage inputs must be non-negative and map size positive")
+    unit_assist_time_s = map_size_m / PX4_MISSION_CRUISE_SPEED_MPS
+    survey_distance_m = 0.0
+    sorties = 0
+    if mode == "ground_only":
+        flight_time_s = 0.0
+        total_navigation_time_s = ugv_navigation_time_s
+    elif mode == "counterfactual_uav":
+        sorties = request_count
+        flight_time_s = request_count * unit_assist_time_s
+        # The real request policy holds the UGV, while its ground-truth map
+        # producer currently answers instantly. Charge the omitted service
+        # time sequentially instead of slowing Gazebo down.
+        total_navigation_time_s = ugv_navigation_time_s + flight_time_s
+    elif mode == "explore_then_drive":
+        sorties = 1
+        survey_distance_m = route_coverage_distance_m(route, map_size_m)
+        flight_time_s = survey_distance_m / PX4_MISSION_CRUISE_SPEED_MPS
+        total_navigation_time_s = flight_time_s + ugv_navigation_time_s
+    elif mode in ("greedy_uav", "always_on_uav"):
+        sorties = 1
+        flight_time_s = ugv_navigation_time_s
+        total_navigation_time_s = ugv_navigation_time_s
+    else:
+        raise ValueError(f"unknown assistance mode: {mode}")
+    return {
+        "uav_flight_time_s": round(flight_time_s, 2),
+        "total_navigation_time_s": round(total_navigation_time_s, 2),
+        "uav_sorties": sorties,
+        "uav_survey_distance_m": round(survey_distance_m, 2),
+        "uav_assist_unit_time_s": round(unit_assist_time_s, 2),
+    }
 
 
 class RoverWatcher:
@@ -462,6 +535,14 @@ def run_trial(
         uav_requests = int(json.loads(status_path.read_text(encoding="utf-8"))["request_count"])
     except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         pass
+    ugv_navigation_time_s = sim_s - sim_start
+    uav_usage = estimate_uav_usage(
+        args.assistance,
+        route,
+        ugv_navigation_time_s,
+        uav_requests,
+        args.uav_map_size,
+    )
     return {
         "cycle": trial.cycle,
         "seed": trial.seed,
@@ -469,7 +550,7 @@ def run_trial(
         "direction": trial.direction,
         "outcome": outcome,
         "success": int(outcome == "success"),
-        "sim_time_s": round(sim_s - sim_start, 2),
+        "sim_time_s": round(ugv_navigation_time_s, 2),
         "wall_time_s": round(time.monotonic() - wall_start, 2),
         "path_length_m": round(path_m, 2),
         "route_length_m": round(trial.route_length_m, 2),
@@ -477,6 +558,9 @@ def run_trial(
         "interventions_resolved": resolved,
         "route_progress_m": round(route_progress_m, 2),
         "uav_requests": uav_requests,
+        **uav_usage,
+        "uav_speed_mps": PX4_MISSION_CRUISE_SPEED_MPS,
+        "uav_map_size_m": args.uav_map_size,
         "planner": args.planner,
         "assistance": args.assistance,
         "uav_uncertainty_threshold": args.uav_uncertainty_threshold,
@@ -517,6 +601,7 @@ def main() -> int:
             "ground_only",
             "greedy_uav",
             "counterfactual_uav",
+            "explore_then_drive",
             "always_on_uav",
         ),
         default="ground_only",
@@ -636,7 +721,10 @@ def main() -> int:
         "cycle", "seed", "route", "direction", "outcome", "success",
         "sim_time_s", "wall_time_s", "path_length_m", "route_length_m",
         "interventions", "interventions_resolved", "route_progress_m",
-        "uav_requests", "planner", "assistance", "uav_uncertainty_threshold",
+        "uav_requests", "uav_flight_time_s", "total_navigation_time_s",
+        "uav_sorties", "uav_survey_distance_m", "uav_assist_unit_time_s",
+        "uav_speed_mps", "uav_map_size_m", "planner", "assistance",
+        "uav_uncertainty_threshold",
         "uav_path_uncertainty_threshold", "uav_probe_uncertainty_threshold",
         "uav_probe_hit_window", "uav_probe_hits", "uav_probe_min_world_speed",
         "uav_grass_occupancy_probability", "uav_recovery_duration",
@@ -673,6 +761,8 @@ def main() -> int:
                 handle_file.flush()
                 print(
                     f"    {row['outcome']}: {row['sim_time_s']:.0f}s sim, "
+                    f"{row['total_navigation_time_s']:.0f}s total navigation, "
+                    f"{row['uav_flight_time_s']:.0f}s UAV flight, "
                     f"{row['path_length_m']:.0f} m driven, {row['interventions']} drags, "
                     f"{row['uav_requests']} UAV requests",
                     flush=True,
