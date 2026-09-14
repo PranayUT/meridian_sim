@@ -23,7 +23,7 @@ All work described here is present in the working tree but is not committed.
 There were already related dirty changes when this calibration work began, so
 do not discard or reset the working tree wholesale.
 
-The current focused test command passes 47 tests:
+The current focused test command passes 48 tests:
 
 ```bash
 conda run --no-capture-output --name rugged-ugv \
@@ -563,7 +563,50 @@ Request behaviour itself improved: three requests instead of five, all
 controller resolves frontier cells sooner, so fewer of them mature into a
 request.
 
-## Immediate next steps
+## Always-on UAV upper-bound campaign
+
+The `always_on_uav` assistance mode is a deliberately optimistic information
+baseline. At node startup it generates one exact aerial raster covering the
+entire active route with half the configured UAV-map size (12.5 m by default)
+of padding on every side. The product contains both physical occupancy and
+semantic traversability, is fused before the first planner command, and stays
+in the map stack for the full trial.
+
+This arm has no uncertainty trigger, request latency, stop/wait/fuse cycle, or
+request count. Its `uav_requests` result is therefore zero: that means "zero
+reactive requests," not "no UAV." It represents a UAV that is already flying
+and continuously makes its map available to the ground vehicle.
+
+That makes it useful as an upper-bound diagnostic. It should outperform
+`ground_only` and `counterfactual_uav` if accurate aerial information helps the
+current planner. If it does not, more aggressive request triggering cannot fix
+the result; the map representation, fusion costs, or planner response needs to
+be investigated instead.
+
+The working counterfactual validation uses Route 11, seeds 20 through 43, in
+both directions: 24 seeds x 1 route x 2 directions = 48 matched trials. Run
+the always-on arm over those same cases, but queue them one at a time (the
+campaign launcher now defaults to one job):
+
+```bash
+./scripts/run_campaign.sh \
+  --campaign r11_always_on_48_v1 \
+  --rounds 24 \
+  --jobs 1 \
+  --rtf 1 \
+  --seed 20 \
+  --routes "Route-11" \
+  --directions "forward reverse" \
+  --assistance always_on_uav \
+  --lockstep
+```
+
+Compare this against `r11_trigger_shadow_48_v3` and
+`r11_probe_assisted_recovery_48_v1`, retaining the same Gazebo seed, lockstep
+setting, and drag-harness parameters. Compare endpoint success first, then
+simulator time, distance driven, drag interventions/regions, and missed
+controller cycles. Because `--jobs 1` limits concurrency rather than trial
+count, all 48 trials still run, but never at the same time.
 
 ## Drag-regression debugging after the `_v2` comparison
 
@@ -652,7 +695,7 @@ but simulator physics is no longer silently unseeded.
 
 ### Current verification status
 
-The focused suite now passes 43 tests:
+The focused suite now passes 48 tests:
 
 ```bash
 conda run --no-capture-output --name rugged-ugv \

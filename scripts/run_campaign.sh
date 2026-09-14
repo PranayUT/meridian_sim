@@ -22,7 +22,9 @@ if ! python -c "import numpy; import gz.transport13" >/dev/null 2>&1; then
 fi
 
 ROUNDS=3
-JOBS=2
+# Queue trials serially by default so a large campaign is safe on a modest
+# machine. Callers with measured headroom can still opt into more workers.
+JOBS=1
 RTF=3
 SEED=7
 CAMPAIGN=""
@@ -42,12 +44,12 @@ usage() {
 Usage: scripts/run_campaign.sh [options]
 
   --rounds N       vegetation/planner seeds to sweep (default 3)
-  --jobs N         simulators to run at once (default 2)
+  --jobs N         simulators to run at once (default 1; trials are queued)
   --rtf X          real-time factor per simulator (default 3)
   --seed S         first round's seed; round r uses S + r (default 7)
   --routes "A B"   routes from paths/from_truck (default Route-11 Route-12 Route-13)
   --directions "forward reverse"
-  --assistance MODE  ground_only, greedy_uav, or counterfactual_uav
+  --assistance MODE  ground_only, greedy_uav, counterfactual_uav, or always_on_uav
   --uav-threshold X request when uncertain rollout exposure reaches X (default .20)
   --mapping-maturity X  seconds one swept cell must remain uncertain (default 1.0)
   --campaign NAME  run-id prefix and summary filter (default a timestamp)
@@ -106,9 +108,10 @@ if ((CPUS_PER_TRIAL > 0)); then
   fi
 fi
 case "${ASSISTANCE}" in
-  ground_only|greedy_uav|counterfactual_uav) ;;
+  ground_only|greedy_uav|counterfactual_uav|always_on_uav) ;;
   *)
-    echo "--assistance must be ground_only, greedy_uav, or counterfactual_uav" >&2
+    echo "--assistance must be ground_only, greedy_uav, counterfactual_uav," \
+         "or always_on_uav" >&2
     exit 2
     ;;
 esac

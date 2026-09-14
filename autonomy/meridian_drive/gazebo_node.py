@@ -25,7 +25,13 @@ from gz.transport13 import Node
 from .assistance import MODES, AssistanceManager, MappedRecovery
 from .core import MPPI, MppiConfig, Route, rollout
 from .ground_mapping import GroundMapper, SemanticMapper, write_snapshot
-from .maps import AssistanceEvaluation, LocalGridMap, MapStack, TerrainMap
+from .maps import (
+    COMBINED_MAP_TYPE,
+    AssistanceEvaluation,
+    LocalGridMap,
+    MapStack,
+    TerrainMap,
+)
 from .routes import find_default_route, load_route
 from .uav_ground_truth import GroundTruthUav
 from .visualization import GazeboMarkers
@@ -118,6 +124,35 @@ class GazeboAutonomy:
             request_handler=ground_truth_uav,
             clock=self.now,
         )
+        if args.assistance == "always_on_uav":
+            # This is an oracle-information upper bound: keep the equivalent
+            # of a 25 m local UAV view around every route point available from
+            # the first planner tick onward. Align outward to raster cells so
+            # the generated map cannot lose its far edge to rounding.
+            assert ground_truth_uav is not None
+            padding = args.uav_map_size / 2.0
+            resolution = args.uav_resolution
+            route_x = self.route.xy[:, 0]
+            route_y = self.route.xy[:, 1]
+            roi = (
+                math.floor((float(np.min(route_x)) - padding) / resolution)
+                * resolution,
+                math.floor((float(np.min(route_y)) - padding) / resolution)
+                * resolution,
+                math.ceil((float(np.max(route_x)) + padding) / resolution)
+                * resolution,
+                math.ceil((float(np.max(route_y)) + padding) / resolution)
+                * resolution,
+            )
+            # The combined product contains both evidence channels. Unlike
+            # reactive assistance, this proactive baseline has no request
+            # count, stop, wait, or fusion-settling penalty.
+            ground_truth_uav(roi, 1, COMBINED_MAP_TYPE)
+            if not self.assistance.reload_map(force=True):
+                raise RuntimeError("could not load the always-on UAV baseline map")
+            self.assistance.detail = (
+                "route-wide occupancy and semantic aerial evidence loaded"
+            )
         # Assistance evaluation is the most expensive thing in the control
         # tick. It runs every tick by default so the counterfactual sees the
         # same rollout population the planner just acted on, and so per-cell
@@ -1019,6 +1054,8 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"simulated UAV semantic masks do not exist: {args.uav_semantic_masks}")
         if not args.world_file.is_file():
             parser.error(f"simulator world does not exist: {args.world_file}")
+    if args.assistance == "always_on_uav" and args.uav_source != "ground_truth":
+        parser.error("always_on_uav requires --uav-source ground_truth")
     return args
 
 

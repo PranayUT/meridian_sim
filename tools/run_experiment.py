@@ -505,7 +505,12 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=7, help="seed of the first cycle")
     parser.add_argument(
         "--assistance",
-        choices=("ground_only", "greedy_uav", "counterfactual_uav"),
+        choices=(
+            "ground_only",
+            "greedy_uav",
+            "counterfactual_uav",
+            "always_on_uav",
+        ),
         default="ground_only",
     )
     parser.add_argument("--uav-source", choices=("ground_truth", "file"), default="ground_truth")

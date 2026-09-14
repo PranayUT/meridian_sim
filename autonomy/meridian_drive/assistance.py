@@ -19,7 +19,7 @@ from .maps import (
     load_uav_map,
 )
 
-MODES = ("ground_only", "greedy_uav", "counterfactual_uav")
+MODES = ("ground_only", "greedy_uav", "counterfactual_uav", "always_on_uav")
 
 
 @dataclass
@@ -169,7 +169,7 @@ class AssistanceManager:
     def hold(self) -> bool:
         return self.mode == "counterfactual_uav" and self.state != "driving"
 
-    def reload_map(self) -> bool:
+    def reload_map(self, *, force: bool = False) -> bool:
         # Ground-only trials must remain ground-only even if a UAV result from
         # an earlier campaign is still present at the configured path.
         if self.mode == "ground_only":
@@ -179,7 +179,7 @@ class AssistanceManager:
             stat = self.map_path.stat()
         except FileNotFoundError:
             return False
-        if stat.st_mtime_ns == self._map_mtime_ns:
+        if not force and stat.st_mtime_ns == self._map_mtime_ns:
             return False
         try:
             candidate = load_uav_map(self.map_path)
@@ -223,6 +223,17 @@ class AssistanceManager:
             else:
                 self._write_status(exposure)
                 return
+
+        # The always-on arm is an optimistic information baseline, not a
+        # request policy. GazeboAutonomy installs one exact route-wide product
+        # before the first control tick, so residual or out-of-bounds
+        # uncertainty must never turn into a reactive request here.
+        if self.mode == "always_on_uav":
+            self.detail = "route-wide aerial evidence is continuously fused"
+            if now - self._last_status_s >= 0.5:
+                self._write_status(exposure)
+                self._last_status_s = now
+            return
 
         if self.state == "stopping":
             if abs(speed_mps) <= self.stop_speed_mps:

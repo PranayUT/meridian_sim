@@ -987,6 +987,46 @@ class MapTests(unittest.TestCase):
             self.assertIsNone(stack.aerial)
             self.assertFalse(manager.reload_map())
 
+    def test_always_on_uav_never_requests_or_holds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stack = MapStack()
+            map_path = root / "map.npz"
+            manager = AssistanceManager(
+                "always_on_uav",
+                map_path,
+                root / "request.json",
+                root / "status.json",
+                stack,
+                persistence_s=0.0,
+            )
+            np.savez_compressed(
+                map_path,
+                cost=np.zeros((2, 2), dtype=np.float32),
+                obstacle=np.zeros((2, 2), dtype=np.float32),
+                uncertainty=np.zeros((2, 2), dtype=np.float32),
+                map_types=np.asarray((SEMANTIC_MAP_TYPE, OCCUPANCY_MAP_TYPE)),
+                origin_xy=np.asarray((0.0, 0.0)),
+                resolution=np.asarray(1.0),
+                sequence=np.asarray(1),
+            )
+            self.assertTrue(manager.reload_map())
+
+            manager.update(
+                1.0,
+                (0.0, 0.0, 5.0, 5.0),
+                source="lidar_occupancy",
+                map_type=OCCUPANCY_MAP_TYPE,
+                decision_relevant=True,
+                action_relevant=True,
+                mobility_stalled=True,
+            )
+
+            self.assertFalse(manager.hold)
+            self.assertFalse((root / "request.json").exists())
+            self.assertEqual(manager._request_count, 0)
+            self.assertEqual(len(stack.aerial_history), 1)
+
 
 class AerialSamplingTest(unittest.TestCase):
     """Retained-product sampling was made cheaper; it must stay identical."""

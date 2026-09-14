@@ -146,6 +146,7 @@ Select one of the Meridian Drive experiment policies when autonomy starts:
 ./scripts/run_autonomy.sh --assistance ground_only
 ./scripts/run_autonomy.sh --assistance greedy_uav
 ./scripts/run_autonomy.sh --assistance counterfactual_uav
+./scripts/run_autonomy.sh --assistance always_on_uav
 ```
 
 The UAV modes default to `--uav-source ground_truth`. This is the experiment
@@ -211,6 +212,11 @@ new map, waits for fusion settling, and resumes. As in Meridian Drive, it
 permits two requests for one 5 m region and source, then holds for operator
 action. Unlike the field policy's expanding retry, every simulator response
 remains exactly 25 m by 25 m.
+
+`always_on_uav` is an optimistic simulator baseline. Exact physical occupancy
+and semantic traversability covering the full route plus a 12.5 m margin are
+fused before the first control tick and remain available throughout the run.
+It makes no reactive requests and never holds the rover.
 
 For example, run Route 11 at the 20% starting point and inspect its request
 count and channel scores before changing the policy:
@@ -280,7 +286,8 @@ costs 1-2 late cycles per 100, and 5x misses about 40 per 100. Lower
 `scripts/run_experiment.sh` drives a campaign and records one CSV row per
 trial. It runs each named route forward and reversed, cycling the seed. The
 default is ground-only assistance; pass `--assistance counterfactual_uav` for
-the request-driven ground-truth UAV condition:
+the request-driven ground-truth UAV condition, or `--assistance always_on_uav`
+for the route-wide optimistic baseline:
 
 ```bash
 ./scripts/run_experiment.sh --cycles 5 --rtf 3
