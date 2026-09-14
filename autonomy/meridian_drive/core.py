@@ -32,6 +32,10 @@ class VehicleModel:
     acceleration_max: float = 2.46
     brake_max: float = 2.3
     lateral_acceleration_max: float = 6.25
+    # Reverse is reserved for leaving a footprint that is already confirmed
+    # occupied. Without it an aerial map can diagnose a physical wedge but the
+    # optimizer has no control capable of backing away from the contact.
+    reverse_speed_max: float = 0.75
 
 
 @dataclass(frozen=True)
@@ -167,7 +171,9 @@ def rollout(initial: np.ndarray, controls: np.ndarray, model: VehicleModel, dt: 
             -model.brake_max,
             model.acceleration_max,
         )
-        speed = np.maximum(0.0, old[:, SPEED] + dt * acceleration)
+        speed = np.maximum(
+            -model.reverse_speed_max, old[:, SPEED] + dt * acceleration
+        )
         steer_target = model.steer_max * command[:, 1]
         steer = old[:, STEER] + steer_alpha * (steer_target - old[:, STEER])
         yaw_rate = speed * np.tan(steer) / model.wheelbase
@@ -191,14 +197,16 @@ def _smooth_noise(rng: np.random.Generator, samples: int, horizon: int, knots: i
     return output
 
 
-def _escape_controls(config: MppiConfig) -> np.ndarray:
+def _escape_controls(
+    config: MppiConfig, count: int | None = None, reverse: bool = False
+) -> np.ndarray:
     """Return paired forward S-turn proposals for obstacle escape.
 
     These are absolute controls rather than perturbations of the warm start.
     That distinction matters after MPPI has correctly slowed for an obstacle:
     perturbing a near-zero speed sequence only proposes more ways to stop.
     """
-    count = min(config.escape_samples, config.samples)
+    count = min(config.escape_samples if count is None else count, config.samples)
     count -= count % 2
     if count == 0:
         return np.empty((0, config.horizon, 2), dtype=np.float64)
@@ -220,7 +228,7 @@ def _escape_controls(config: MppiConfig) -> np.ndarray:
             (index // (len(speeds) * len(amplitudes))) % len(turn_fractions)
         ]
         turn_steps = max(2, min(config.horizon // 2, round(config.horizon * fraction)))
-        output[index, :, 0] = speed
+        output[index, :, 0] = -min(0.75, speed) if reverse else speed
         output[index, :turn_steps, 1] = amplitude
         output[index, turn_steps : 2 * turn_steps, 1] = -amplitude
         output[index + half] = output[index]
@@ -421,6 +429,10 @@ class MPPI:
             self.progress_m + 8.0,
         )
         self.progress_m = max(self.progress_m, float(current_progress[0]))
+        _, initial_collision = map_stack.cost(
+            np.asarray([state[X]]), np.asarray([state[Y]])
+        )
+        escaping_overlap = bool(initial_collision[0])
         self._commands_since_plan += 1
         guidance_distance = math.inf
         if self.guidance_route is not None:
@@ -456,9 +468,23 @@ class MPPI:
         noise[pairs : 2 * pairs, :, 0] = velocity_noise
         noise[pairs : 2 * pairs, :, 1] = -steering_noise
         controls = self.nominal[None, :, :] + noise
-        controls[:, :, 0] = np.clip(controls[:, :, 0], 0.0, cfg.speed_max)
+        minimum_speed = -self.model.reverse_speed_max if escaping_overlap else 0.0
+        controls[:, :, 0] = np.clip(
+            controls[:, :, 0], minimum_speed, cfg.speed_max
+        )
         controls[:, :, 1] = np.clip(controls[:, :, 1], -1.0, 1.0)
-        escape_controls = _escape_controls(cfg)
+        if escaping_overlap:
+            forward_count = cfg.escape_samples // 2
+            escape_controls = np.concatenate(
+                (
+                    _escape_controls(cfg, forward_count),
+                    _escape_controls(
+                        cfg, cfg.escape_samples - forward_count, reverse=True
+                    ),
+                )
+            )
+        else:
+            escape_controls = _escape_controls(cfg)
         if len(escape_controls):
             controls[-len(escape_controls) :] = escape_controls
 
@@ -490,10 +516,6 @@ class MPPI:
         )
         costs += cfg.map_cost_weight * np.sum(map_cost, axis=1)
         hard_collision = np.any(map_collision, axis=1)
-        _, initial_collision = map_stack.cost(
-            np.asarray([state[X]]), np.asarray([state[Y]])
-        )
-        escaping_overlap = bool(initial_collision[0])
         if escaping_overlap:
             # Stopping cannot resolve a collision the rover is already in.
             # Prefer the rollout that sheds collision exposure fastest, even
@@ -525,7 +547,7 @@ class MPPI:
         moving_safe = (~hard_collision) & (
             progress_gain >= cfg.minimum_safe_progress_m
         )
-        if np.any(moving_safe):
+        if not escaping_overlap and np.any(moving_safe):
             costs += (~hard_collision & ~moving_safe) * cfg.collision_cost
 
         if np.all(hard_collision):

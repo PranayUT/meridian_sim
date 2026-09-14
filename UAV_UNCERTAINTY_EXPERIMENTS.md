@@ -559,6 +559,110 @@ request.
 
 ## Immediate next steps
 
+## Drag-regression debugging after the `_v2` comparison
+
+The `_v2` result established the actual regression: Route 11 forward seed 7
+needed eight drags with `counterfactual_uav`, against three with
+`ground_only`. Debugging found that this was not one tuning error. Several
+interfaces made UAV assistance structurally unable to help reliably.
+
+### UAV truth did not supersede planner evidence
+
+The uncertainty evaluator correctly let an answered UAV product supersede its
+matching ground uncertainty, but `MapStack.cost` did not. Planner costs were a
+maximum over ground and aerial layers. Consequently, clear UAV occupancy could
+clear an assistance trigger but could not remove a false-positive ground
+occupancy cost or collision. Aerial evidence could only add constraints; it
+could never open a route that ground sensing had incorrectly closed.
+
+Planner fusion now applies product-specific supersession inside aerial
+coverage:
+
+- `canopy_obstacle` replaces classified and probabilistic lidar occupancy;
+- `semantic_traversability` replaces ground semantic cost and obstacle
+  probability;
+- neither product replaces the other channel or evidence outside its 25 m
+  footprint.
+
+Two focused tests pin both directions of this rule.
+
+### Local UAV products were being discarded
+
+`MapStack` held only one `aerial` map. Every atomic result replaced it. Because
+requests can alternate occupancy and semantics, a semantic response erased the
+last occupancy answer; moving into another region also erased all earlier
+coverage. The policy therefore repeatedly rediscovered uncertainty it had
+already paid to resolve.
+
+The stack now retains UAV products across channels and route regions. For
+overlapping products of the same type, the newest sequence wins. Ground-only
+initialization clears the full retained history, so stale maps still cannot
+leak into a control trial.
+
+### A hard raster supplied no clearance margin
+
+The aerial obstacle body was sharp and binary. The local guide treated only the
+body cells as blocked and could choose the immediately adjacent grid cell. Map
+resolution, footprint discretization, and Gazebo contact then turned a
+nominally clear detour into a physical wedge. UAV maps now derive a 0.75 m
+linear soft-clearance field around confirmed bodies. The original hard body
+and collision threshold are unchanged; the added field supplies a lateral
+gradient without inventing a larger hard obstacle.
+
+### Confirmed overlap had no executable escape
+
+The existing overlap exception intended to choose the rollout that left a
+known collision fastest. Two later rules defeated it: controls were
+forward-only, and the generic minimum-forward-progress penalty overrode the
+overlap cost. The planner can now sample bounded reverse maneuvers only while
+its current footprint is confirmed occupied, and the generic forward-progress
+penalty is disabled during that overlap. A unit test places the rover in a
+forward-closed contact geometry and verifies that it backs into clear space.
+
+### Loss-of-mobility requests and rejected experiment
+
+The 0.75 population exposure threshold sometimes left UAV assistance dormant
+through every drag region. Wheel-derived odometry was not a valid fallback
+trigger because it remains high during wheel slip. The node now detects five
+simulator seconds with less than 0.25 m of world-pose displacement. If the
+rollout still contains a mature uncertain ROI, that one physical stall episode
+may raise one request through the existing two-second source persistence. It
+does not retrigger until real displacement resumes. Request history records
+this as `mobility_relevant`.
+
+An intermediate run, `r11_uav_world_stall_rtf1`, is explicitly rejected. It
+completed in 752 s with five drags and 18 requests. That run reset its mobility
+episode during every requested hold and replaced each preceding UAV product,
+creating an occupancy/semantic request loop. The retained-map and edge-trigger
+fixes were made from this trace.
+
+### Reproducibility correction
+
+`--seed` seeded MPPI but `scripts/run_experiment.sh` did not pass a Gazebo
+physics seed. The launcher now passes deterministic seed 4207 by default,
+overrideable with `GZ_SIM_SEED`. Callback scheduling can still perturb the
+single-process Python controller, so one paired result remains insufficient,
+but simulator physics is no longer silently unseeded.
+
+### Current verification status
+
+The focused suite now passes 36 tests:
+
+```bash
+conda run --no-capture-output --name rugged-ugv \
+  python -m unittest discover -s autonomy -p 'test*.py'
+```
+
+The current end-to-end run is `r11_uav_persistent_escape_full_rtf1`, Route 11
+forward, planner seed 7, Gazebo seed 4207, 1.0x RTF, threshold 0.75, and
+maturity 1.0 s. At simulator time 224 s it has made one retained semantic UAV
+request and needed two drags. This is an in-progress observation, not a final
+result. The ground-only `_v2` control completed with three drags.
+
+The target for accepting this work is an assisted endpoint run with fewer than
+three drags under the paired configuration, followed by a fresh deterministic
+ground-only control on the same launcher and seeds.
+
 0. Separate the planner's tick budget from the comparison before running more
    paired trials. At a 50%+ miss rate the assisted mode is being measured
    partly on its own evaluation cost. Try `--assistance-period` above zero, or

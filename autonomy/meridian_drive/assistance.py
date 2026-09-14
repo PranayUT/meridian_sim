@@ -60,10 +60,13 @@ class AssistanceManager:
         self._pending_map_type = ""
         self._pending_exposure = 0.0
         self._pending_decision_relevant = False
+        self._pending_mobility_relevant = False
+        self._mobility_relevant = False
+        self._mobility_episode_served = False
         # Meridian Drive excludes aerial evidence older than the active trial.
         # Remember any pre-existing file so only a later atomic replacement is
         # admitted, whether this run uses the simulator or an external source.
-        self.map_stack.aerial = None
+        self.map_stack.clear_aerial()
         if self.mode != "ground_only":
             try:
                 self._map_mtime_ns = self.map_path.stat().st_mtime_ns
@@ -78,7 +81,7 @@ class AssistanceManager:
         # Ground-only trials must remain ground-only even if a UAV result from
         # an earlier campaign is still present at the configured path.
         if self.mode == "ground_only":
-            self.map_stack.aerial = None
+            self.map_stack.clear_aerial()
             return False
         try:
             stat = self.map_path.stat()
@@ -91,7 +94,7 @@ class AssistanceManager:
         except MapFormatError as error:
             self.detail = str(error)
             return False
-        self.map_stack.aerial = candidate
+        self.map_stack.add_aerial(candidate)
         self._map_mtime_ns = stat.st_mtime_ns
         if self.state == "waiting":
             self.state = "fusing"
@@ -110,6 +113,7 @@ class AssistanceManager:
         map_type: str = "",
         decision_relevant: bool = False,
         speed_mps: float = 0.0,
+        mobility_stalled: bool = False,
     ) -> None:
         if self.reload_map():
             # The exposure came from the prior map. Let the next planner cycle
@@ -138,6 +142,7 @@ class AssistanceManager:
                         source=self._pending_source,
                         map_type=self._pending_map_type,
                         decision_relevant=self._pending_decision_relevant,
+                        mobility_relevant=self._pending_mobility_relevant,
                     )
                     self.state = "waiting"
             else:
@@ -145,8 +150,28 @@ class AssistanceManager:
             self._write_status(exposure)
             return
 
+        # Sustained loss of mobility in a mature uncertain ROI is itself
+        # decision-relevant. This includes both a physical wedge (the model
+        # commands motion that does not happen) and planner deadlock (the
+        # uncertain evidence makes the model command zero). Waiting for a high
+        # population-wide exposure in either case can leave the UAV dormant
+        # until the drag harness intervenes. The normal source persistence
+        # below rejects transient acceleration, braking, and steering pauses.
+        mobility_relevant = (
+            roi is not None
+            and bool(source)
+            and mobility_stalled
+            and not self._mobility_episode_served
+        )
+        if not mobility_stalled:
+            self._mobility_episode_served = False
+        self._mobility_relevant = mobility_relevant
         should_request = (
-            (decision_relevant or exposure >= self.uncertainty_threshold)
+            (
+                decision_relevant
+                or mobility_relevant
+                or exposure >= self.uncertainty_threshold
+            )
             and roi is not None
             and bool(source)
         )
@@ -177,6 +202,7 @@ class AssistanceManager:
                     source=source,
                     map_type=map_type,
                     decision_relevant=decision_relevant,
+                    mobility_relevant=mobility_relevant,
                 )
         elif persistent:
             assert roi is not None
@@ -197,8 +223,16 @@ class AssistanceManager:
                     self._pending_map_type = map_type
                     self._pending_exposure = exposure
                     self._pending_decision_relevant = decision_relevant
+                    self._pending_mobility_relevant = mobility_relevant
+                    if mobility_relevant:
+                        self._mobility_episode_served = True
                     self._stopped_since = None
-                    self.detail = "uncertainty crossed the rollout threshold; stopping to ask for help"
+                    reason = (
+                        "commanded motion stalled in an uncertain ROI"
+                        if mobility_relevant
+                        else "uncertainty crossed the rollout threshold"
+                    )
+                    self.detail = f"{reason}; stopping to ask for help"
         if now - self._last_status_s >= 0.5:
             self._write_status(exposure)
             self._last_status_s = now
@@ -211,6 +245,7 @@ class AssistanceManager:
         source: str,
         map_type: str,
         decision_relevant: bool = False,
+        mobility_relevant: bool = False,
     ) -> None:
         roi = self._fixed_roi(roi)
         self._request_id = uuid.uuid4().hex
@@ -227,6 +262,7 @@ class AssistanceManager:
             "roi_xy": [[x0, y1], [x1, y1], [x1, y0], [x0, y0]],
             "uncertainty_exposure": exposure,
             "decision_relevant": decision_relevant,
+            "mobility_relevant": mobility_relevant,
             "hold_requested": hold,
             "result_path": str(self.map_path),
             "created_unix_s": time.time(),
@@ -265,6 +301,7 @@ class AssistanceManager:
             "uncertainty_threshold": self.uncertainty_threshold,
             "map_size_m": self.map_size_m,
             "uncertainty_exposure": exposure,
+            "mobility_relevant": self._mobility_relevant,
             "map_loaded": aerial is not None,
             "map_sequence": aerial.sequence if aerial is not None else None,
             "detail": self.detail,

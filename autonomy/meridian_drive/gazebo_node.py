@@ -118,6 +118,8 @@ class GazeboAutonomy:
         self.steer_state = 0.0
         self.velocity_command = 0.0
         self.wheel_angle_command = 0.0
+        self.mobility_anchor_s = 0.0
+        self.mobility_anchor_xy: tuple[float, float] | None = None
         if not self.node.subscribe(Odometry, args.odometry_topic, self._on_odometry):
             raise RuntimeError(f"cannot subscribe to {args.odometry_topic}")
         self.model_name = args.model_name
@@ -147,7 +149,7 @@ class GazeboAutonomy:
 
     def _on_odometry(self, message: Odometry) -> None:
         with self.lock:
-            self.speed = max(0.0, float(message.twist.linear.x))
+            self.speed = float(message.twist.linear.x)
             if self.pose is not None:
                 self.pose = (*self.pose[:3], self.speed)
 
@@ -364,6 +366,19 @@ class GazeboAutonomy:
             )
             self.last_assistance_s = now_s
         evaluation = self.last_evaluation
+        # Odometry is driven by wheel rotation and remains high when the rover
+        # spins its wheels against vegetation. Detect loss of mobility from
+        # world displacement, which is also what the intervention harness
+        # measures. Reset while assistance deliberately holds the rover so a
+        # completed request cannot trigger another request on its own stop.
+        if (
+            now_s < self.mobility_anchor_s
+            or self.mobility_anchor_xy is None
+            or math.dist((x, y), self.mobility_anchor_xy) >= 0.25
+        ):
+            self.mobility_anchor_s = now_s
+            self.mobility_anchor_xy = (x, y)
+        mobility_stalled = now_s - self.mobility_anchor_s >= 5.0
         self.assistance.update(
             evaluation.uncertainty_exposure,
             evaluation.roi,
@@ -371,6 +386,7 @@ class GazeboAutonomy:
             map_type=evaluation.map_type,
             decision_relevant=evaluation.decision_relevant,
             speed_mps=speed,
+            mobility_stalled=mobility_stalled,
         )
         if self.assistance.hold:
             command[:] = 0.0

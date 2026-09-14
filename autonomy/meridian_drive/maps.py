@@ -106,6 +106,7 @@ class LocalGridMap:
 class UavMap:
     cost_grid: np.ndarray
     obstacle_grid: np.ndarray
+    obstacle_clearance_grid: np.ndarray
     uncertainty_grid: np.ndarray
     origin_x: float
     origin_y: float
@@ -141,6 +142,35 @@ class UavMap:
         uncertainty = np.where(covered, self.uncertainty_grid[safe_row, safe_col], 1.0)
         valid = covered & np.isfinite(cost) & np.isfinite(obstacle) & np.isfinite(uncertainty)
         return cost, obstacle, uncertainty, valid
+
+    def sample_planner(
+        self, x: np.ndarray, y: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Sample all planner-facing layers with one coordinate lookup."""
+        col = np.floor((x - self.origin_x) / self.resolution).astype(np.int64)
+        row = np.floor((y - self.origin_y) / self.resolution).astype(np.int64)
+        covered = (
+            (row >= 0)
+            & (row < self.shape[0])
+            & (col >= 0)
+            & (col < self.shape[1])
+        )
+        safe_row = np.clip(row, 0, self.shape[0] - 1)
+        safe_col = np.clip(col, 0, self.shape[1] - 1)
+        cost = np.where(covered, self.cost_grid[safe_row, safe_col], 0.0)
+        obstacle = np.where(
+            covered, self.obstacle_grid[safe_row, safe_col], 0.0
+        )
+        clearance = np.where(
+            covered, self.obstacle_clearance_grid[safe_row, safe_col], 0.0
+        )
+        valid = (
+            covered
+            & np.isfinite(cost)
+            & np.isfinite(obstacle)
+            & np.isfinite(clearance)
+        )
+        return cost, obstacle, clearance, valid
 
 
 @dataclass(frozen=True)
@@ -266,6 +296,9 @@ def _validate(
     return UavMap(
         cost_grid=np.clip(cost, 0.0, 1.0),
         obstacle_grid=np.clip(obstacle, 0.0, 1.0),
+        obstacle_clearance_grid=_obstacle_clearance(
+            np.clip(obstacle, 0.0, 1.0), resolution
+        ),
         uncertainty_grid=np.clip(uncertainty, 0.0, 1.0),
         origin_x=float(origin[0]),
         origin_y=float(origin[1]),
@@ -273,6 +306,36 @@ def _validate(
         sequence=sequence,
         map_types=map_types,
     )
+
+
+def _obstacle_clearance(
+    obstacle: np.ndarray, resolution: float, margin_m: float = 0.75
+) -> np.ndarray:
+    """Return a compact linear falloff around an aerial obstacle raster.
+
+    The hard body raster remains unchanged. This derived layer gives MPPI and
+    its local guide a lateral gradient, so they do not choose a path exactly
+    one discretized footprint cell from a body and then clip it in Gazebo.
+    """
+    occupied = np.nan_to_num(obstacle, nan=0.0).astype(np.float32, copy=False)
+    clearance = np.zeros_like(occupied, dtype=np.float32)
+    cells = int(np.ceil(margin_m / resolution))
+    rows, cols = occupied.shape
+    for drow in range(-cells, cells + 1):
+        for dcol in range(-cells, cells + 1):
+            distance = resolution * np.hypot(drow, dcol)
+            if distance >= margin_m:
+                continue
+            weight = 1.0 - distance / margin_m
+            source_row = slice(max(0, -drow), min(rows, rows - drow))
+            source_col = slice(max(0, -dcol), min(cols, cols - dcol))
+            target_row = slice(max(0, drow), min(rows, rows + drow))
+            target_col = slice(max(0, dcol), min(cols, cols + dcol))
+            clearance[target_row, target_col] = np.maximum(
+                clearance[target_row, target_col],
+                weight * occupied[source_row, source_col],
+            )
+    return clearance
 
 
 def load_uav_map(path: Path) -> UavMap:
@@ -294,6 +357,7 @@ class MapStack:
     """The planner-facing fused map view."""
 
     aerial: UavMap | None = None
+    aerial_history: list[UavMap] = field(default_factory=list, repr=False)
     terrain: TerrainMap | None = None
     ground_obstacles: LocalGridMap | None = None
     ground_obstacle_probability: LocalGridMap | None = None
@@ -323,6 +387,48 @@ class MapStack:
         (0.16, 0.16),
     )
 
+    def clear_aerial(self) -> None:
+        self.aerial = None
+        self.aerial_history.clear()
+
+    def add_aerial(self, aerial: UavMap) -> None:
+        """Retain local products instead of replacing prior UAV evidence."""
+        self.aerial = aerial
+        self.aerial_history.append(aerial)
+
+    def _aerial_products(self) -> list[UavMap]:
+        products = list(self.aerial_history)
+        if self.aerial is not None and not any(
+            item is self.aerial for item in products
+        ):
+            products.append(self.aerial)
+        return products
+
+    def _sample_aerial(
+        self, x: np.ndarray, y: np.ndarray, map_type: str
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Sample the newest covering UAV product of one evidence type."""
+        cost = np.zeros_like(x, dtype=np.float64)
+        obstacle = np.zeros_like(x, dtype=np.float64)
+        clearance = np.zeros_like(x, dtype=np.float64)
+        uncertainty = np.ones_like(x, dtype=np.float64)
+        valid = np.zeros_like(x, dtype=bool)
+        # Newest product wins where fixed 25 m requests overlap.
+        for product in reversed(self._aerial_products()):
+            if not product.provides(map_type):
+                continue
+            p_cost, p_obstacle, p_clearance, p_valid = product.sample_planner(
+                x, y
+            )
+            _, _, p_uncertainty, _ = product.sample(x, y)
+            selected = p_valid & ~valid
+            cost = np.where(selected, p_cost, cost)
+            obstacle = np.where(selected, p_obstacle, obstacle)
+            clearance = np.where(selected, p_clearance, clearance)
+            uncertainty = np.where(selected, p_uncertainty, uncertainty)
+            valid |= p_valid
+        return cost, obstacle, clearance, uncertainty, valid
+
     def cost(self, x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         total_cost = np.zeros_like(x)
         collision = np.zeros_like(x, dtype=bool)
@@ -336,17 +442,44 @@ class MapStack:
         # collision signal in this simulator.
         for dx, dy in self._FOOTPRINT_OFFSETS:
             sample_x, sample_y = x + dx, y + dy
+            aerial_cost = np.zeros_like(sample_x, dtype=np.float64)
+            aerial_obstacle = np.zeros_like(sample_x, dtype=np.float64)
+            aerial_valid = np.zeros_like(sample_x, dtype=bool)
+            semantic_override = np.zeros_like(sample_x, dtype=bool)
+            occupancy_override = np.zeros_like(sample_x, dtype=bool)
+            if self._aerial_products():
+                (
+                    occupancy_cost,
+                    occupancy_obstacle,
+                    occupancy_clearance,
+                    _,
+                    occupancy_valid,
+                ) = self._sample_aerial(
+                    sample_x, sample_y, OCCUPANCY_MAP_TYPE
+                )
+                (
+                    semantic_cost,
+                    semantic_obstacle,
+                    semantic_clearance,
+                    _,
+                    semantic_valid,
+                ) = self._sample_aerial(
+                    sample_x, sample_y, SEMANTIC_MAP_TYPE
+                )
+                semantic_override = semantic_valid
+                occupancy_override = occupancy_valid
             if self.ground_semantics is not None:
                 semantic, valid = self.ground_semantics.sample(sample_x, sample_y)
+                known = valid & np.isfinite(semantic) & ~semantic_override
                 total_cost = np.maximum(
                     total_cost,
-                    np.where(valid & np.isfinite(semantic), semantic, 0.0),
+                    np.where(known, semantic, 0.0),
                 )
             if self.ground_semantic_obstacles is not None:
                 obstacle, valid = self.ground_semantic_obstacles.sample(
                     sample_x, sample_y
                 )
-                known = valid & np.isfinite(obstacle)
+                known = valid & np.isfinite(obstacle) & ~semantic_override
                 total_cost = np.maximum(
                     total_cost, np.where(known, 4.0 * obstacle, 0.0)
                 )
@@ -357,24 +490,48 @@ class MapStack:
                 cells, valid = self.ground_obstacles.sample(sample_x, sample_y)
                 # Meridian's TALL class is soft-but-expensive; SOLID is a hard
                 # collision. Unknown remains available to uncertainty logic.
+                known = valid & ~occupancy_override
                 total_cost = np.maximum(
-                    total_cost, np.where(valid & (cells == 50), 3.0, 0.0)
+                    total_cost, np.where(known & (cells == 50), 3.0, 0.0)
                 )
-                collision |= valid & (cells == 100)
+                collision |= known & (cells == 100)
             if self.ground_obstacle_probability is not None:
                 probability, valid = self.ground_obstacle_probability.sample(
                     sample_x, sample_y
                 )
-                known = valid & np.isfinite(probability)
+                known = (
+                    valid & np.isfinite(probability) & ~occupancy_override
+                )
                 total_cost = np.maximum(
                     total_cost, np.where(known, 4.0 * probability, 0.0)
                 )
-            if self.aerial is not None:
-                cost, obstacle, _, valid = self.aerial.sample(sample_x, sample_y)
-                total_cost = np.maximum(
-                    total_cost, np.where(valid, cost + 20.0 * obstacle, 0.0)
+            if self._aerial_products():
+                aerial_cost = np.maximum(occupancy_cost, semantic_cost)
+                aerial_obstacle = np.maximum(
+                    occupancy_obstacle, semantic_obstacle
                 )
-                collision |= valid & (obstacle >= self.collision_probability)
+                aerial_clearance = np.maximum(
+                    occupancy_clearance, semantic_clearance
+                )
+                aerial_valid = occupancy_valid | semantic_valid
+                total_cost = np.maximum(
+                    total_cost,
+                    np.where(
+                        aerial_valid,
+                        aerial_cost + 20.0 * aerial_obstacle,
+                        0.0,
+                    ),
+                )
+                # A hard occupied cell says where the body is; this soft ring
+                # says not to skim that boundary. It is intentionally below
+                # the local guide's 3.5 hard-block cutoff.
+                total_cost = np.maximum(
+                    total_cost,
+                    np.where(aerial_valid, 3.0 * aerial_clearance, 0.0),
+                )
+                collision |= aerial_valid & (
+                    aerial_obstacle >= self.collision_probability
+                )
         return total_cost, collision
 
     def uncertainty_exposure(
@@ -433,7 +590,12 @@ class MapStack:
         if selected is not None:
             return selected
         highest = max(candidates, key=lambda item: item.uncertainty_exposure)
-        return AssistanceEvaluation(highest.uncertainty_exposure, None)
+        # Keep the best mature ROI available even below the exposure gate.
+        # AssistanceManager still enforces that gate for ordinary requests,
+        # but it also needs the ROI when commanded motion has demonstrably
+        # failed. Discarding it here made the UAV blind for the full 30 s until
+        # the experiment harness dragged a physically wedged rover.
+        return highest
 
     def _evidence_exposure(
         self,
@@ -458,8 +620,10 @@ class MapStack:
             uncertain |= valid & (
                 (~known_probability) | ((probability >= 0.20) & (probability <= 0.80))
             )
-        if self.aerial is not None and self.aerial.provides(map_type):
-            _, _, aerial_uncertainty, aerial_valid = self.aerial.sample(x, y)
+        if self._aerial_products():
+            _, _, _, aerial_uncertainty, aerial_valid = self._sample_aerial(
+                x, y, map_type
+            )
             uncertain = np.where(
                 aerial_valid,
                 aerial_uncertainty >= uncertainty_min,
@@ -531,8 +695,14 @@ class MapStack:
             uncertain = (~known) | (variance >= 0.04) | (
                 (probability >= 0.20) & (probability <= 0.80)
             )
-            if self.aerial is not None and self.aerial.provides(OCCUPANCY_MAP_TYPE):
-                _, aerial_probability, aerial_uncertainty, aerial_valid = self.aerial.sample(x, y)
+            if self._aerial_products():
+                (
+                    _,
+                    aerial_probability,
+                    _,
+                    aerial_uncertainty,
+                    aerial_valid,
+                ) = self._sample_aerial(x, y, OCCUPANCY_MAP_TYPE)
                 probability = np.where(aerial_valid, aerial_probability, probability)
                 uncertain = np.where(aerial_valid, aerial_uncertainty >= 0.04, uncertain)
             uncertain = self._mature_sample_uncertainty(

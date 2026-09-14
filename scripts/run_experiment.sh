@@ -91,6 +91,7 @@ fi
 # One Gazebo bus per campaign, so several can share a machine without their
 # topics, services, or set_pose calls reaching each other.
 export GZ_PARTITION="${GZ_PARTITION:-rugged_ugv_${RUN_ID//\//_}}"
+SIM_SEED="${GZ_SIM_SEED:-4207}"
 if [[ ! "${RTF}" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ "${RTF}" == 0 ]]; then
   echo "--rtf needs a positive number, for example --rtf 3" >&2
   exit 2
@@ -148,8 +149,9 @@ else
   SIM_FLAGS+=(--gui-config "${PROJECT_ROOT}/config/hill_country.gui.config")
 fi
 echo "Run ${RUN_ID} on partition ${GZ_PARTITION}"
+echo "Gazebo seed: ${SIM_SEED}"
 echo "Starting Gazebo at ${RTF}x (log: ${SIM_LOG})"
-gz sim --force-version 8 "${SIM_FLAGS[@]}" \
+gz sim --force-version 8 --seed "${SIM_SEED}" "${SIM_FLAGS[@]}" \
   "${PROJECT_ROOT}/worlds/hill_country.sdf" >"${SIM_LOG}" 2>&1 &
 SIM_PID=$!
 # Recorded so a campaign can sweep for simulators whose harness died outright.

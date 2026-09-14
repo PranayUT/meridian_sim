@@ -120,6 +120,25 @@ class DynamicsTests(unittest.TestCase):
             )[0, 1]
         self.assertGreater(float(state[0]), 0.5)
 
+    def test_planner_can_reverse_out_of_confirmed_overlap(self) -> None:
+        route = Route.from_waypoints([(0.0, 0.0), (10.0, 0.0)])
+        planner = MPPI(route, config=MppiConfig(samples=128, horizon=60), seed=7)
+        grid = np.zeros((24, 32), dtype=np.int8)
+        # The current footprint and all forward exits are occupied, while the
+        # ground behind the rover is clear. Forward-only escape cannot solve
+        # this contact geometry.
+        grid[10:14, 4:16] = SOLID
+        stack = MapStack(
+            ground_obstacles=LocalGridMap(grid, -1.0, -3.0, 0.25)
+        )
+        state = np.zeros(5, dtype=np.float64)
+        for _ in range(30):
+            command = planner.command(state, stack, np.empty((0, 2)))
+            state = rollout(
+                state, command.reshape(1, 1, 2), planner.model, planner.config.dt
+            )[0, 1]
+        self.assertLess(float(state[0]), -0.15)
+
     def test_route_11_projects_to_terrain_coordinates(self) -> None:
         path = Path(__file__).resolve().parents[2] / "paths" / "Route 11.kmz"
         points = load_route(path)
@@ -369,6 +388,92 @@ class MapTests(unittest.TestCase):
         self.assertGreater(float(cost[1]), float(cost[0]))
         self.assertEqual(collision.tolist(), [False, False, False])
 
+    def test_clear_uav_occupancy_supersedes_only_ground_occupancy(self) -> None:
+        ground_classes = LocalGridMap(
+            np.asarray([[100, 100, 100]], dtype=np.int8), 0.0, 0.0, 1.0
+        )
+        ground_probability = LocalGridMap(
+            np.asarray([[1.0, 1.0, 1.0]], dtype=np.float32),
+            0.0,
+            0.0,
+            1.0,
+        )
+        semantic_obstacles = LocalGridMap(
+            np.asarray([[0.0, 1.0, 0.0]], dtype=np.float32),
+            0.0,
+            0.0,
+            1.0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "occupancy.npz"
+            np.savez_compressed(
+                path,
+                obstacle=np.zeros((1, 2), dtype=np.float32),
+                uncertainty=np.zeros((1, 2), dtype=np.float32),
+                map_types=np.asarray((OCCUPANCY_MAP_TYPE,)),
+                origin_xy=np.asarray((0.0, 0.0)),
+                resolution=np.asarray(1.0),
+            )
+            aerial = load_uav_map(path)
+        stack = MapStack(
+            aerial=aerial,
+            ground_obstacles=ground_classes,
+            ground_obstacle_probability=ground_probability,
+            ground_semantic_obstacles=semantic_obstacles,
+        )
+
+        cost, collision = stack.cost(
+            np.asarray([0.5, 1.5, 2.5]), np.asarray([0.5] * 3)
+        )
+
+        # Clear occupancy truth removes matching structural and probabilistic
+        # ground evidence inside its footprint. It neither clears the semantic
+        # channel nor affects ground occupancy beyond the UAV map.
+        self.assertEqual(cost.tolist(), [0.0, 4.0, 4.0])
+        self.assertEqual(collision.tolist(), [False, True, True])
+
+    def test_clear_uav_semantics_supersedes_only_ground_semantics(self) -> None:
+        ground_classes = LocalGridMap(
+            np.asarray([[0, 100, 0]], dtype=np.int8), 0.0, 0.0, 1.0
+        )
+        semantic_cost = LocalGridMap(
+            np.asarray([[0.8, 0.8, 0.8]], dtype=np.float32),
+            0.0,
+            0.0,
+            1.0,
+        )
+        semantic_obstacles = LocalGridMap(
+            np.ones((1, 3), dtype=np.float32), 0.0, 0.0, 1.0
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "semantic.npz"
+            np.savez_compressed(
+                path,
+                cost=np.zeros((1, 2), dtype=np.float32),
+                obstacle=np.zeros((1, 2), dtype=np.float32),
+                uncertainty=np.zeros((1, 2), dtype=np.float32),
+                map_types=np.asarray((SEMANTIC_MAP_TYPE,)),
+                origin_xy=np.asarray((0.0, 0.0)),
+                resolution=np.asarray(1.0),
+            )
+            aerial = load_uav_map(path)
+        stack = MapStack(
+            aerial=aerial,
+            ground_obstacles=ground_classes,
+            ground_semantics=semantic_cost,
+            ground_semantic_obstacles=semantic_obstacles,
+        )
+
+        cost, collision = stack.cost(
+            np.asarray([0.5, 1.5, 2.5]), np.asarray([0.5] * 3)
+        )
+
+        # Semantic truth clears only its matching layers. The ground SOLID in
+        # the occupancy channel remains a collision, as does semantic evidence
+        # outside aerial coverage.
+        self.assertEqual(cost.tolist(), [0.0, 0.0, 4.0])
+        self.assertEqual(collision.tolist(), [False, True, True])
+
     def test_perfect_camera_labels_project_to_semantic_cost(self) -> None:
         mapper = SemanticMapper()
         labels = np.zeros((5, 5), dtype=np.uint8)
@@ -454,6 +559,32 @@ class MapTests(unittest.TestCase):
             self.assertEqual(float(obstacle[0]), 0.0)
             self.assertEqual(layer.sequence, 4)
 
+    def test_uav_obstacles_provide_soft_clearance_without_false_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "map.npz"
+            np.savez_compressed(
+                path,
+                obstacle=np.asarray(
+                    [[0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]],
+                    dtype=np.float32,
+                ),
+                uncertainty=np.zeros((1, 9), dtype=np.float32),
+                map_types=np.asarray((OCCUPANCY_MAP_TYPE,)),
+                origin_xy=np.asarray((0.0, 0.0)),
+                resolution=np.asarray(0.25),
+            )
+            stack = MapStack(aerial=load_uav_map(path))
+
+        cost, collision = stack.cost(
+            np.asarray([0.625, 1.125, 1.625]), np.asarray([0.125] * 3)
+        )
+
+        self.assertGreater(float(cost[0]), 0.0)
+        self.assertGreater(float(cost[2]), 0.0)
+        self.assertLess(float(cost[0]), 3.5)
+        self.assertLess(float(cost[2]), 3.5)
+        self.assertEqual(collision.tolist(), [False, True, False])
+
     def test_meridian_map_flips_north_up_rows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "map.npz"
@@ -525,6 +656,43 @@ class MapTests(unittest.TestCase):
             manager.update(0.0, None)
             self.assertFalse(manager.hold)
             self.assertEqual(manager.map_stack.aerial.sequence, 1)
+
+    def test_stalled_motion_requests_a_mature_roi(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = AssistanceManager(
+                "counterfactual_uav",
+                root / "map.npz",
+                root / "request.json",
+                root / "status.json",
+                MapStack(),
+                uncertainty_threshold=0.75,
+                persistence_s=0.0,
+                stop_settle_s=0.0,
+            )
+
+            manager.update(
+                0.10,
+                (0.0, 0.0, 5.0, 5.0),
+                source="lidar_occupancy",
+                map_type=OCCUPANCY_MAP_TYPE,
+                speed_mps=0.0,
+                mobility_stalled=True,
+            )
+            self.assertTrue(manager.hold)
+            manager.update(
+                0.10,
+                (0.0, 0.0, 5.0, 5.0),
+                source="lidar_occupancy",
+                map_type=OCCUPANCY_MAP_TYPE,
+                speed_mps=0.0,
+                mobility_stalled=True,
+            )
+
+            request = json.loads((root / "request.json").read_text())
+            self.assertTrue(request["mobility_relevant"])
+            self.assertFalse(request["decision_relevant"])
+            self.assertLess(request["uncertainty_exposure"], 0.75)
 
     def test_ground_truth_uav_writes_occupancy_and_goose_labels(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -617,6 +785,36 @@ class MapTests(unittest.TestCase):
         self.assertEqual(semantic.uncertainty_exposure, 0.0)
         self.assertEqual(occupancy.source, "lidar_occupancy")
         self.assertEqual(occupancy.uncertainty_exposure, 1.0)
+
+    def test_uav_products_accumulate_across_channels_and_regions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stack = MapStack()
+            for sequence, map_type, origin, obstacle in (
+                (1, OCCUPANCY_MAP_TYPE, (0.0, 0.0), 1.0),
+                (2, SEMANTIC_MAP_TYPE, (10.0, 0.0), 1.0),
+            ):
+                path = root / f"{sequence}.npz"
+                np.savez_compressed(
+                    path,
+                    cost=np.zeros((1, 1), dtype=np.float32),
+                    obstacle=np.asarray([[obstacle]], dtype=np.float32),
+                    uncertainty=np.zeros((1, 1), dtype=np.float32),
+                    map_types=np.asarray((map_type,)),
+                    origin_xy=np.asarray(origin),
+                    resolution=np.asarray(1.0),
+                    sequence=np.asarray(sequence),
+                )
+                stack.add_aerial(load_uav_map(path))
+
+        cost, collision = stack.cost(
+            np.asarray([0.5, 10.5]), np.asarray([0.5, 0.5])
+        )
+        self.assertEqual(len(stack.aerial_history), 2)
+        self.assertEqual(stack.aerial.sequence, 2)
+        self.assertGreater(float(cost[0]), 0.0)
+        self.assertGreater(float(cost[1]), 0.0)
+        self.assertEqual(collision.tolist(), [True, True])
 
     def test_ground_only_never_loads_a_stale_uav_map(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
