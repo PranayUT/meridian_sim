@@ -3,6 +3,17 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# A trial has to hold a 20 Hz planner deadline. Left unpinned, several trials
+# on one machine migrate across cores and evict each other's caches, so the
+# controller sheds ticks long before the machine runs out of CPU. Giving a
+# trial its own cores makes its tick rate independent of how many other trials
+# are running, which is what a paired comparison needs. Pin the whole tree, so
+# the simulator and the planner stay together.
+if [[ -n "${TRIAL_CPUS:-}" && -z "${TRIAL_CPUS_APPLIED:-}" ]]; then
+  export TRIAL_CPUS_APPLIED=1
+  exec taskset -c "${TRIAL_CPUS}" "${BASH_SOURCE[0]}" "$@"
+fi
+
 if ! python -c "import numpy; import gz.transport13" >/dev/null 2>&1; then
   if command -v conda >/dev/null 2>&1; then
     exec conda run --no-capture-output --name rugged-ugv \

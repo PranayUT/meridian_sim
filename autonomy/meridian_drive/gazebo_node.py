@@ -16,6 +16,8 @@ from gz.msgs10.image_pb2 import Image
 from gz.msgs10.odometry_pb2 import Odometry
 from gz.msgs10.pose_v_pb2 import Pose_V
 from gz.msgs10.twist_pb2 import Twist
+from gz.msgs10.world_control_pb2 import WorldControl
+from gz.msgs10.boolean_pb2 import Boolean
 from gz.transport13 import Node
 
 from .assistance import MODES, AssistanceManager
@@ -34,6 +36,10 @@ class GazeboAutonomy:
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.node = Node()
+        world_name = args.world_pose_topic.strip('/').split('/')[1]
+        self.world_control_service = f"/world/{world_name}/control"
+        self.lockstep = bool(args.lockstep)
+        self.physics_step_s = float(args.physics_step)
         self.publisher = self.node.advertise(args.command_topic, Twist)
         waypoints = load_route(args.route_file) if args.route_file else (args.waypoint or DEFAULT_ROUTE)
         self.route_anchors = np.asarray(waypoints, dtype=np.float64)
@@ -82,6 +88,7 @@ class GazeboAutonomy:
             uncertainty_threshold=args.uav_uncertainty_threshold,
             map_size_m=args.uav_map_size,
             request_handler=ground_truth_uav,
+            clock=self.now,
         )
         # Assistance evaluation is the most expensive thing in the control
         # tick. It runs every tick by default so the counterfactual sees the
@@ -449,6 +456,47 @@ class GazeboAutonomy:
                 self.clock.wait(timeout=min(0.05, remaining))
         return True
 
+    def _world_control(self, **fields: object) -> bool:
+        """Send one WorldControl request, returning whether it was confirmed."""
+        request = WorldControl()
+        for name, value in fields.items():
+            setattr(request, name, value)
+        try:
+            confirmed, response = self.node.request(
+                self.world_control_service, request, WorldControl, Boolean, 2000
+            )
+        except Exception:  # transport errors here are not worth ending a trial
+            return False
+        return bool(confirmed and response.data)
+
+    def _advance_world(self, steps: int, period: float) -> bool:
+        """Step the world by exactly one control period and wait for its clock.
+
+        Free-running, the world advances on its own schedule and the planner
+        sheds whatever ticks it cannot afford, so the autonomy silently falls
+        out of step with the physics whenever the machine is busy. Driving the
+        steps from here inverts that: the world only moves when the controller
+        is ready for it, so a trial sees the same 20 Hz in simulator time no
+        matter how many trials share the machine.
+        """
+        with self.clock:
+            target = self.sim_s + period
+        # The acknowledgement can arrive later than the physics it asked for,
+        # so the simulator clock decides whether the step happened, not the
+        # reply. Giving up on an unconfirmed request instead would re-send on
+        # the next tick and step the world twice for one control period.
+        self._world_control(pause=True, multi_step=steps)
+        # The pose feed carries the simulator stamp, so it reports when the
+        # requested block of physics has actually been integrated.
+        limit = time.monotonic() + 10.0
+        with self.clock:
+            while self.running and self.sim_s < target - 1e-9:
+                remaining = limit - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self.clock.wait(timeout=min(0.05, remaining))
+        return True
+
     def run(self) -> None:
         print(
             f"Meridian Drive MPPI is following {self.route_name} with {self.assistance.mode}. "
@@ -461,9 +509,43 @@ class GazeboAutonomy:
         deadline = self.now()
         late_cycles = 0
         last_report_s = self.now()
+        steps_per_tick = int(round(period / self.physics_step_s))
+        if self.lockstep:
+            if abs(steps_per_tick * self.physics_step_s - period) > 1e-9:
+                raise RuntimeError(
+                    f"control period {period}s is not a whole number of "
+                    f"{self.physics_step_s}s physics steps"
+                )
+            # Take the world under control before the first tick, so no physics
+            # runs that this controller has not asked for.
+            if not any(self._world_control(pause=True) for _ in range(3)):
+                print(
+                    "Could not pause the world for lockstep; the simulator is "
+                    "free-running and the controller may shed ticks.",
+                    flush=True,
+                )
+            print(
+                f"Lockstep: driving {steps_per_tick} x {self.physics_step_s}s "
+                f"physics steps per {period}s control tick.",
+                flush=True,
+            )
         try:
             while self.running:
                 self.step()
+                if self.lockstep:
+                    if not self._advance_world(steps_per_tick, period):
+                        late_cycles += 1
+                    now = self.now()
+                    if now - last_report_s >= 5.0:
+                        if late_cycles:
+                            print(
+                                f"Lockstep stalled on {late_cycles} of the last "
+                                f"{round(5.0 / period)} steps: the simulator did "
+                                "not confirm the requested physics.",
+                                flush=True,
+                            )
+                        last_report_s, late_cycles = now, 0
+                    continue
                 now = self.now()
                 deadline += period
                 if now < deadline - period:
@@ -484,6 +566,10 @@ class GazeboAutonomy:
                     last_report_s, late_cycles = now, 0
         finally:
             self.running = False
+            # Hand the world back, so a simulator that outlives this process is
+            # not left frozen with its clock stopped.
+            if self.lockstep:
+                self._world_control(pause=False)
             self.mapping_event.set()
             self.mapping_thread.join(timeout=2.0)
             if self.markers is not None:
@@ -550,6 +636,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--marker-service", default="/marker_array")
     parser.add_argument("--no-visualization", action="store_true")
+    parser.add_argument(
+        "--lockstep", action="store_true",
+        help="drive the world one control period at a time, so the planner's "
+             "rate in simulator time does not depend on machine load",
+    )
+    parser.add_argument(
+        "--physics-step", type=float, default=0.001,
+        help="the world's max_step_size; the control period must be a whole "
+             "multiple of it under --lockstep",
+    )
     args = parser.parse_args()
     if args.route_file is not None and args.waypoint:
         parser.error("use route-file or waypoint, not both")

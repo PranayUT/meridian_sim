@@ -310,6 +310,8 @@ def run_trial(
         "--uav-request", str(args.run_dir / "uav_request.json"),
         "--no-visualization",
     ]
+    if args.lockstep:
+        command.extend(("--lockstep", "--physics-step", str(args.physics_step)))
     if trial.veg_seed:
         command.extend(("--uav-vegetation-seed", str(int(trial.veg_seed))))
     log_path = args.run_dir / f"node_c{trial.cycle}_{trial.route}_{trial.direction}.log"
@@ -454,6 +456,12 @@ def main() -> int:
                         help="fraction of the route that must be covered before "
                              "reaching the goal counts as success")
     parser.add_argument("--min-speed", type=float, default=0.5, help="sets the per-trial deadline")
+    parser.add_argument(
+        "--lockstep", action="store_true",
+        help="step the world from the planner so its rate in simulator time "
+             "is the same whether one trial or twenty share the machine",
+    )
+    parser.add_argument("--physics-step", type=float, default=0.001)
     parser.add_argument("--grace-s", type=float, default=120.0)
     # 0.25 m was tighter than the rover's own footprint: a trial could drive its
     # route correctly and still never be credited, circling the goal until the

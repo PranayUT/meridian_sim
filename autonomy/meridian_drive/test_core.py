@@ -657,6 +657,41 @@ class MapTests(unittest.TestCase):
             self.assertFalse(manager.hold)
             self.assertEqual(manager.map_stack.aerial.sequence, 1)
 
+    def test_persistence_is_measured_on_the_supplied_clock(self) -> None:
+        """Timing windows are spans of vehicle time, not of wall time.
+
+        The node paces everything else on the simulator clock, so a campaign
+        that runs the world slower than real time must not shorten the source
+        persistence the request policy was calibrated against.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sim_s = 0.0
+            manager = AssistanceManager(
+                "counterfactual_uav",
+                root / "map.npz",
+                root / "request.json",
+                root / "status.json",
+                MapStack(),
+                uncertainty_threshold=0.5,
+                persistence_s=2.0,
+                stop_settle_s=0.0,
+                clock=lambda: sim_s,
+            )
+            roi = (0.0, 0.0, 5.0, 5.0)
+            for sim_s in (0.0, 0.5, 1.0, 1.5):
+                manager.update(
+                    1.0, roi, source="lidar_occupancy", map_type=OCCUPANCY_MAP_TYPE
+                )
+                # Wall time has advanced far past 2 s while running this loop;
+                # only the supplied clock may retire the persistence window.
+                self.assertFalse(manager.hold, f"requested early at {sim_s} s")
+            sim_s = 2.0
+            manager.update(
+                1.0, roi, source="lidar_occupancy", map_type=OCCUPANCY_MAP_TYPE
+            )
+            self.assertTrue(manager.hold)
+
     def test_stalled_motion_requests_a_mature_roi(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

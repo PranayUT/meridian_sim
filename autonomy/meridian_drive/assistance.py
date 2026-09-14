@@ -29,6 +29,13 @@ class AssistanceManager:
     stop_speed_mps: float = 0.08
     stop_settle_s: float = 0.5
     fusion_settle_s: float = 1.0
+    # Every interval below is a span of vehicle time, so it has to be measured
+    # on the same clock the planner and the maturity gates use. Reading the
+    # wall clock instead made these windows depend on the real-time factor and
+    # on how loaded the machine was, which silently changed request behaviour
+    # between a solo run and a campaign. Defaults to the wall clock for
+    # callers that have no simulator.
+    clock: Callable[[], float] = time.monotonic
 
     def __post_init__(self) -> None:
         if self.mode not in MODES:
@@ -98,7 +105,7 @@ class AssistanceManager:
         self._map_mtime_ns = stat.st_mtime_ns
         if self.state == "waiting":
             self.state = "fusing"
-            self._fusion_started_s = time.monotonic()
+            self._fusion_started_s = self.clock()
             self.detail = f"UAV map sequence {candidate.sequence} is entering the planner"
         else:
             self.detail = f"UAV map sequence {candidate.sequence} loaded"
@@ -119,7 +126,7 @@ class AssistanceManager:
             # The exposure came from the prior map. Let the next planner cycle
             # evaluate the new evidence before it can request another result.
             return
-        now = time.monotonic()
+        now = self.clock()
         if self.state == "fusing":
             if now - self._fusion_started_s >= self.fusion_settle_s:
                 self.state = "driving"
@@ -250,7 +257,7 @@ class AssistanceManager:
         roi = self._fixed_roi(roi)
         self._request_id = uuid.uuid4().hex
         self._request_count += 1
-        self._last_request_s = time.monotonic()
+        self._last_request_s = self.clock()
         x0, y0, x1, y1 = roi
         payload = {
             "version": 1,

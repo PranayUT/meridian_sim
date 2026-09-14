@@ -31,6 +31,11 @@ DIRECTIONS=(forward reverse)
 ASSISTANCE="ground_only"
 UAV_THRESHOLD="0.20"
 MAPPING_MATURITY="1.0"
+# Zero leaves trials unpinned, which is the right default for a campaign that
+# has a machine to itself. Set it to give each concurrent trial its own cores.
+CPUS_PER_TRIAL=0
+CPU_BASE=0
+LOCKSTEP_ARGS=()
 
 usage() {
   cat <<'USAGE'
@@ -46,6 +51,10 @@ Usage: scripts/run_campaign.sh [options]
   --uav-threshold X request when uncertain rollout exposure reaches X (default .20)
   --mapping-maturity X  seconds one swept cell must remain uncertain (default 1.0)
   --campaign NAME  run-id prefix and summary filter (default a timestamp)
+  --cpus-per-trial N  pin each concurrent trial to its own N cores (default 0, unpinned)
+  --cpu-base N     first core to hand out, so two campaigns can share a machine
+  --lockstep       step the world from the planner, so a trial runs at the same
+                   rate in simulator time however many trials share the machine
 USAGE
 }
 
@@ -61,6 +70,9 @@ while (($# > 0)); do
     --assistance) ASSISTANCE="$2"; shift 2 ;;
     --uav-threshold) UAV_THRESHOLD="$2"; shift 2 ;;
     --mapping-maturity) MAPPING_MATURITY="$2"; shift 2 ;;
+    --cpus-per-trial) CPUS_PER_TRIAL="$2"; shift 2 ;;
+    --cpu-base) CPU_BASE="$2"; shift 2 ;;
+    --lockstep) LOCKSTEP_ARGS=(--lockstep); shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -75,6 +87,23 @@ done
 if [[ ! "${SEED}" =~ ^[0-9]+$ ]]; then
   echo "--seed needs a non-negative integer" >&2
   exit 2
+fi
+for pair in "cpus-per-trial:${CPUS_PER_TRIAL}" "cpu-base:${CPU_BASE}"; do
+  if [[ ! "${pair#*:}" =~ ^[0-9]+$ ]]; then
+    echo "--${pair%%:*} needs a non-negative integer" >&2
+    exit 2
+  fi
+done
+if ((CPUS_PER_TRIAL > 0)); then
+  online_cpus="$(nproc)"
+  if ((CPU_BASE + JOBS * CPUS_PER_TRIAL > online_cpus)); then
+    echo "pinning needs $((CPU_BASE + JOBS * CPUS_PER_TRIAL)) cores but only ${online_cpus} are online" >&2
+    exit 2
+  fi
+  if ! command -v taskset >/dev/null 2>&1; then
+    echo "--cpus-per-trial needs taskset (util-linux)" >&2
+    exit 2
+  fi
 fi
 case "${ASSISTANCE}" in
   ground_only|greedy_uav|counterfactual_uav) ;;
@@ -171,23 +200,53 @@ shutdown() {
 }
 trap shutdown INT TERM
 
+# Slots are claimed with mkdir, which is atomic, so two trials dispatched at
+# the same moment cannot be handed the same cores.
+SLOT_DIR="${CAMPAIGN_DIR}/.slots"
+rm -rf "${SLOT_DIR}"
+mkdir -p "${SLOT_DIR}"
+
+claim_slot() {
+  local index
+  while true; do
+    for ((index = 0; index < JOBS; index++)); do
+      if mkdir "${SLOT_DIR}/${index}" 2>/dev/null; then
+        echo "${index}"
+        return 0
+      fi
+    done
+    sleep 0.2
+  done
+}
+
 run_trial() {
   local trial="$1" route="$2" direction="$3" seed="$4" veg_root="$5"
   local run_dir="${CAMPAIGN_DIR}/${trial}"
   mkdir -p "${run_dir}"
-  echo "$(date +%H:%M:%S) start ${trial}"
+  local slot="" first=0
+  if ((CPUS_PER_TRIAL > 0)); then
+    slot="$(claim_slot)"
+    first=$((CPU_BASE + slot * CPUS_PER_TRIAL))
+    export TRIAL_CPUS="${first}-$((first + CPUS_PER_TRIAL - 1))"
+    echo "$(date +%H:%M:%S) start ${trial} on cores ${TRIAL_CPUS}"
+  else
+    echo "$(date +%H:%M:%S) start ${trial}"
+  fi
   if "${PROJECT_ROOT}/scripts/run_experiment.sh" \
       --run-id "${CAMPAIGN}/${trial}" --rtf "${RTF}" --veg-root "${veg_root}" \
       --routes "${route}" --directions "${direction}" \
       --cycles 1 --seed "${seed}" --veg-seed "${seed}" \
       --assistance "${ASSISTANCE}" --uav-uncertainty-threshold "${UAV_THRESHOLD}" \
       --mapping-uncertainty-maturity "${MAPPING_MATURITY}" \
+      ${LOCKSTEP_ARGS[@]+"${LOCKSTEP_ARGS[@]}"} \
       >"${run_dir}/campaign.log" 2>&1; then
     echo "$(date +%H:%M:%S) done  ${trial}"
   else
     echo "$(date +%H:%M:%S) FAILED ${trial} (see ${run_dir}/campaign.log)"
     echo "${trial}" >>"${FAILURES}"
   fi
+  [[ -n "${slot}" ]] && rmdir "${SLOT_DIR}/${slot}" 2>/dev/null
+  return 0
 }
 
 for ((round = 0; round < ROUNDS; round++)); do
