@@ -38,6 +38,25 @@ source scripts/env.sh
 ./scripts/run_autonomy.sh
 ```
 
+To run the GP-Navigation baseline against the same route, localization, LiDAR,
+semantic maps, and Ackermann rover, use:
+
+```bash
+./scripts/run_gp_navigation.sh
+```
+
+This is a ROS-free adaptation of the ICRA 2024 implementation. It retains the
+sparse-GP elevation and uncertainty map, geometric traversability calculation,
+local RRT* planner, 5 m rolling planning radius, and 2 Hz replanning rate. The
+upstream ROS Noetic action servers and differential-drive waypoint follower are
+replaced by this simulator's Gazebo Transport boundary and an Ackermann
+pure-pursuit follower. Use `--gp-iterations`, `--gp-inducing-points`,
+`--gp-radius`, and `--gp-traversability-limit` to change baseline parameters.
+The traversability cutoff defaults to `0.6` here instead of the upstream `0.3`;
+the upstream documentation identifies it as environment-dependent, and `0.3`
+disconnects free space on this substantially rougher terrain. The shared hard
+obstacle and 42% grade constraints remain active.
+
 When `paths/` contains one KMZ, KML, or Meridian GPS JSON file, autonomy loads
 it automatically. The supplied `paths/Route 11.kmz` projects into the Gazebo
 world from the WGS84 datum in the world file. The rover starts at its first
