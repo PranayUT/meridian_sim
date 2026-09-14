@@ -12,7 +12,7 @@ import numpy as np
 from tools.vegetation import Plant, plants_from_masks
 
 from .ground_mapping import GOOSE_COSTS, SEMANTIC_OBSTACLE_LABELS
-from .maps import OCCUPANCY_MAP_TYPE, SEMANTIC_MAP_TYPE
+from .maps import COMBINED_MAP_TYPE, OCCUPANCY_MAP_TYPE, SEMANTIC_MAP_TYPE
 
 
 @dataclass(frozen=True)
@@ -34,13 +34,17 @@ class GroundTruthUav:
         plants: list[Plant],
         fixed_features: list[LabeledEllipse] | None = None,
         resolution: float = 0.25,
+        grass_occupancy_probability: float = 0.04,
     ) -> None:
         if resolution <= 0.0:
             raise ValueError("UAV resolution must be positive")
+        if not 0.0 <= grass_occupancy_probability <= 1.0:
+            raise ValueError("grass occupancy probability must be between 0 and 1")
         self.result_path = result_path
         self.plants = plants
         self.fixed_features = fixed_features or []
         self.resolution = resolution
+        self.grass_occupancy_probability = grass_occupancy_probability
 
     @classmethod
     def from_world(
@@ -50,6 +54,7 @@ class GroundTruthUav:
         world_path: Path,
         vegetation_seed: int | None = None,
         resolution: float = 0.25,
+        grass_occupancy_probability: float = 0.04,
     ) -> "GroundTruthUav":
         with np.load(masks_path, allow_pickle=False) as archive:
             masks = {kind: np.asarray(archive[kind], dtype=bool) for kind in ("grass", "bush", "tree")}
@@ -63,7 +68,13 @@ class GroundTruthUav:
             density,
             saved_seed if vegetation_seed is None else vegetation_seed,
         )
-        return cls(result_path, plants, _labeled_ellipses(world_path), resolution)
+        return cls(
+            result_path,
+            plants,
+            _labeled_ellipses(world_path),
+            resolution,
+            grass_occupancy_probability,
+        )
 
     def __call__(
         self,
@@ -79,9 +90,17 @@ class GroundTruthUav:
         asked about, and vice versa. An unnamed type keeps the original
         both-layer response for external callers.
         """
-        if map_type and map_type not in (SEMANTIC_MAP_TYPE, OCCUPANCY_MAP_TYPE):
+        if map_type and map_type not in (
+            SEMANTIC_MAP_TYPE,
+            OCCUPANCY_MAP_TYPE,
+            COMBINED_MAP_TYPE,
+        ):
             raise ValueError(f"unknown UAV map type: {map_type}")
-        map_types = (map_type,) if map_type else (SEMANTIC_MAP_TYPE, OCCUPANCY_MAP_TYPE)
+        map_types = (
+            (SEMANTIC_MAP_TYPE, OCCUPANCY_MAP_TYPE)
+            if map_type in ("", COMBINED_MAP_TYPE)
+            else (map_type,)
+        )
         wants_semantic = SEMANTIC_MAP_TYPE in map_types
         wants_occupancy = OCCUPANCY_MAP_TYPE in map_types
         x0, y0, x1, y1 = roi
@@ -100,7 +119,16 @@ class GroundTruthUav:
         # Plants are ordered grass, bush, tree. Later, taller vegetation wins
         # the top-down semantic label just as it does in a UAV image.
         semantic_radius = {"grass": 0.20, "bush": 0.75, "tree": 1.35}
-        occupancy_radius = {"bush": 0.43, "tree": 0.20}
+        # Match every body written to vegetation collision.obj. Grass tufts
+        # are individually climbable, but a dense patch can stop this rover;
+        # declaring those collision cylinders confidently clear made the UAV
+        # steer into exactly the wedges it was meant to prevent.
+        occupancy_radius = {"grass": 0.11, "bush": 0.43, "tree": 0.20}
+        occupancy_probability = {
+            "grass": self.grass_occupancy_probability,
+            "bush": 1.0,
+            "tree": 1.0,
+        }
         goose_label = {"grass": 50, "bush": 17, "tree": 28}
         for plant in self.plants:
             radius = semantic_radius[plant.kind] * plant.scale
@@ -110,8 +138,30 @@ class GroundTruthUav:
             if goose_label[plant.kind] in SEMANTIC_OBSTACLE_LABELS:
                 _paint_ellipse(semantic_obstacle, 1.0, plant.x, plant.y, radius, radius, 0.0, x0, y0, self.resolution)
             if plant.kind in occupancy_radius:
-                body = occupancy_radius[plant.kind] * plant.scale
-                _paint_ellipse(obstacle, 1.0, plant.x, plant.y, body, body, 0.0, x0, y0, self.resolution)
+                # Mark every raster cell the physical body intersects. Testing
+                # cell centres alone can entirely erase a body smaller than
+                # half the 0.25 m product resolution.
+                body = (
+                    occupancy_radius[plant.kind] * plant.scale
+                    + self.resolution / np.sqrt(2.0)
+                )
+                # Dense grass is a serious drag risk, not an impassable wall.
+                # 0.04 yields a 1.2 fused cost with its semantic score. That is
+                # enough to prefer a clear detour without making dense grass so
+                # expensive that MPPI stops instead of traversing it when no
+                # detour exists. Bush/tree bodies remain hard collisions.
+                _paint_ellipse(
+                    obstacle,
+                    occupancy_probability[plant.kind],
+                    plant.x,
+                    plant.y,
+                    body,
+                    body,
+                    0.0,
+                    x0,
+                    y0,
+                    self.resolution,
+                )
 
         for feature in self.fixed_features:
             radius = max(feature.radius_x, feature.radius_y)

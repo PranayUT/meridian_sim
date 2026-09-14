@@ -10,9 +10,83 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .maps import MapFormatError, MapStack, load_uav_map
+from .maps import (
+    COMBINED_MAP_TYPE,
+    OCCUPANCY_MAP_TYPE,
+    SEMANTIC_MAP_TYPE,
+    MapFormatError,
+    MapStack,
+    load_uav_map,
+)
 
 MODES = ("ground_only", "greedy_uav", "counterfactual_uav")
+
+
+@dataclass
+class MappedRecovery:
+    """Bounded simulator-time back-out used only after mapped mobility loss."""
+
+    duration_s: float = 2.0
+    speed_mps: float = 0.6
+    steering_fraction: float = 0.65
+    cooldown_s: float = 3.0
+    max_attempts_per_location: int = 1
+    rearm_progress_m: float = 2.0
+
+    def __post_init__(self) -> None:
+        if min(
+            self.duration_s,
+            self.speed_mps,
+            self.cooldown_s,
+            self.rearm_progress_m,
+        ) < 0.0:
+            raise ValueError("mapped recovery timing and speed must be non-negative")
+        if self.max_attempts_per_location < 1:
+            raise ValueError("mapped recovery attempts must be positive")
+        if not 0.0 <= self.steering_fraction <= 1.0:
+            raise ValueError("mapped recovery steering must be between 0 and 1")
+        self.active_until_s = -float("inf")
+        self.cooldown_until_s = -float("inf")
+        self.count = 0
+        self.location_attempts = 0
+        self.rearm_progress_anchor_m: float | None = None
+
+    def update(
+        self,
+        now_s: float,
+        *,
+        stalled: bool,
+        enabled: bool,
+        progress_m: float | None = None,
+    ) -> tuple[float, float, bool] | None:
+        """Return speed, normalized steering, and whether recovery just began."""
+        if progress_m is not None:
+            if self.rearm_progress_anchor_m is None:
+                self.rearm_progress_anchor_m = progress_m
+            elif (
+                progress_m - self.rearm_progress_anchor_m
+                >= self.rearm_progress_m
+            ):
+                self.location_attempts = 0
+                self.rearm_progress_anchor_m = progress_m
+        if not enabled or self.duration_s <= 0.0:
+            self.active_until_s = -float("inf")
+            return None
+        if now_s < self.active_until_s:
+            sign = 1.0 if self.count % 2 else -1.0
+            return -self.speed_mps, sign * self.steering_fraction, False
+        if (
+            not stalled
+            or now_s < self.cooldown_until_s
+            or self.location_attempts >= self.max_attempts_per_location
+        ):
+            return None
+        self.count += 1
+        self.location_attempts += 1
+        self.active_until_s = now_s + self.duration_s
+        self.cooldown_until_s = self.active_until_s + self.cooldown_s
+        sign = 1.0 if self.count % 2 else -1.0
+        return -self.speed_mps, sign * self.steering_fraction, True
 
 
 @dataclass
@@ -73,11 +147,13 @@ class AssistanceManager:
         self._pending_exposure = 0.0
         self._pending_decision_relevant = False
         self._pending_action_relevant = False
+        self._pending_probe_relevant = False
         self._pending_mobility_relevant = False
         self._pending_sim_time_s: float | None = None
         self._pending_position_xy: tuple[float, float] | None = None
         self._mobility_relevant = False
         self._action_relevant = False
+        self._probe_relevant = False
         self._mobility_episode_served = False
         # Meridian Drive excludes aerial evidence older than the active trial.
         # Remember any pre-existing file so only a later atomic replacement is
@@ -129,6 +205,7 @@ class AssistanceManager:
         map_type: str = "",
         decision_relevant: bool = False,
         action_relevant: bool = False,
+        probe_relevant: bool = False,
         speed_mps: float = 0.0,
         mobility_stalled: bool = False,
         sim_time_s: float | None = None,
@@ -162,6 +239,7 @@ class AssistanceManager:
                         map_type=self._pending_map_type,
                         decision_relevant=self._pending_decision_relevant,
                         action_relevant=self._pending_action_relevant,
+                        probe_relevant=self._pending_probe_relevant,
                         mobility_relevant=self._pending_mobility_relevant,
                         sim_time_s=self._pending_sim_time_s,
                         position_xy=self._pending_position_xy,
@@ -189,10 +267,12 @@ class AssistanceManager:
             self._mobility_episode_served = False
         self._mobility_relevant = mobility_relevant
         self._action_relevant = action_relevant
+        self._probe_relevant = probe_relevant
         should_request = (
             (
                 decision_relevant
                 or action_relevant
+                or probe_relevant
                 or mobility_relevant
                 or exposure >= self.uncertainty_threshold
             )
@@ -209,14 +289,24 @@ class AssistanceManager:
             self._high_since.setdefault(source, now)
         else:
             self._high_since.pop(source, None)
-        persistent = should_request and now - self._high_since[source] >= self.persistence_s
+        # The forward probe has already converted one strong observation into
+        # a multi-second rolling condition. Waiting through this generic
+        # persistence window again made a live warning arrive after contact.
+        # Population/action/mobility evidence keeps the original debounce.
+        persistent = should_request and (
+            probe_relevant or now - self._high_since[source] >= self.persistence_s
+        )
         trigger_kind = (
             "mobility"
             if mobility_relevant
             else (
-                "selected_trajectory"
-                if action_relevant
-                else ("counterfactual" if decision_relevant else "exposure")
+                "forward_probe"
+                if probe_relevant
+                else (
+                    "selected_trajectory"
+                    if action_relevant
+                    else ("counterfactual" if decision_relevant else "exposure")
+                )
             )
         )
         if persistent:
@@ -256,6 +346,7 @@ class AssistanceManager:
                     map_type=map_type,
                     decision_relevant=decision_relevant,
                     action_relevant=action_relevant,
+                    probe_relevant=probe_relevant,
                     mobility_relevant=mobility_relevant,
                     sim_time_s=sim_time_s,
                     position_xy=position_xy,
@@ -280,6 +371,7 @@ class AssistanceManager:
                     self._pending_exposure = exposure
                     self._pending_decision_relevant = decision_relevant
                     self._pending_action_relevant = action_relevant
+                    self._pending_probe_relevant = probe_relevant
                     self._pending_mobility_relevant = mobility_relevant
                     self._pending_sim_time_s = sim_time_s
                     self._pending_position_xy = position_xy
@@ -290,9 +382,13 @@ class AssistanceManager:
                         "commanded motion stalled in an uncertain ROI"
                         if mobility_relevant
                         else (
-                            "selected trajectory crossed uncertain evidence"
-                            if action_relevant
-                            else "uncertainty crossed the rollout threshold"
+                            "repeated uncertainty appeared in the forward probe"
+                            if probe_relevant
+                            else (
+                                "selected trajectory crossed uncertain evidence"
+                                if action_relevant
+                                else "uncertainty crossed the rollout threshold"
+                            )
                         )
                     )
                     self.detail = f"{reason}; stopping to ask for help"
@@ -309,6 +405,7 @@ class AssistanceManager:
         map_type: str,
         decision_relevant: bool = False,
         action_relevant: bool = False,
+        probe_relevant: bool = False,
         mobility_relevant: bool = False,
         sim_time_s: float | None = None,
         position_xy: tuple[float, float] | None = None,
@@ -318,17 +415,23 @@ class AssistanceManager:
         self._request_count += 1
         self._last_request_s = self.clock()
         x0, y0, x1, y1 = roi
+        map_types = (
+            [OCCUPANCY_MAP_TYPE, SEMANTIC_MAP_TYPE]
+            if map_type == COMBINED_MAP_TYPE
+            else [map_type]
+        )
         payload = {
             "version": 1,
             "request_id": self._request_id,
             "request_number": self._request_count,
             "frame": "world",
             "source": source,
-            "map_types": [map_type],
+            "map_types": map_types,
             "roi_xy": [[x0, y1], [x1, y1], [x1, y0], [x0, y0]],
             "uncertainty_exposure": exposure,
             "decision_relevant": decision_relevant,
             "action_relevant": action_relevant,
+            "probe_relevant": probe_relevant,
             "mobility_relevant": mobility_relevant,
             "sim_time_s": sim_time_s,
             "vehicle_xy": list(position_xy) if position_xy is not None else None,
@@ -400,6 +503,7 @@ class AssistanceManager:
             "map_size_m": self.map_size_m,
             "uncertainty_exposure": exposure,
             "action_relevant": self._action_relevant,
+            "probe_relevant": self._probe_relevant,
             "mobility_relevant": self._mobility_relevant,
             "map_loaded": aerial is not None,
             "map_sequence": aerial.sequence if aerial is not None else None,

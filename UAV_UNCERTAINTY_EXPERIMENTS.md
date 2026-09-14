@@ -1,6 +1,6 @@
 # UAV uncertainty implementation and Route 11 experiments
 
-Last updated: 2026-09-13
+Last updated: 2026-09-14
 
 ## Goal
 
@@ -8,9 +8,10 @@ Add simulated UAV assistance to the Gazebo autonomy stack while keeping the
 counterfactual behavior close to Meridian Drive. A request returns a fixed
 25 m x 25 m ground-truth map centered on the counterfactual ROI. The map
 contains both obstacle occupancy and semantic traversability derived from
-GOOSE labels. The practical experiment target is fewer than five UAV requests
-over all of Route 11, without imposing an artificial request cap or suppressing
-Meridian's decision-relevant occupancy counterfactual.
+GOOSE labels. The practical target is to request a UAV map before a Route 11
+drag region and use it to reduce stuck interventions. Request count is
+secondary to avoiding a drag; no artificial request cap suppresses Meridian's
+decision-relevant occupancy counterfactual.
 
 The field starting point is 20% uncertain swept-footprint exposure. Simulator
 experiments may use a higher exposure threshold after calibrating the source
@@ -22,7 +23,7 @@ All work described here is present in the working tree but is not committed.
 There were already related dirty changes when this calibration work began, so
 do not discard or reset the working tree wholesale.
 
-The current focused test command passes 43 tests:
+The current focused test command passes 47 tests:
 
 ```bash
 conda run --no-capture-output --name rugged-ugv \
@@ -47,7 +48,7 @@ The response is exactly 25 m x 25 m by default, at 0.25 m resolution
 contains:
 
 - planner `cost`, `obstacle`, and `uncertainty` layers;
-- raw `occupancy` values of 0 or 100;
+- raw `occupancy` probabilities encoded from 0 through 100 (soft grass is 4);
 - raw `semantic_label` GOOSE IDs;
 - lower-left `origin_xy`, `resolution`, and `sequence` metadata.
 
@@ -55,6 +56,11 @@ The main labels used by the simulated world are soil 31, grass 50, brush 17,
 tree 28, and rock 40.
 
 ### One request, one product
+
+This remains the default for the original population and selected-trajectory
+channels. The calibrated forward-probe trigger described below is an explicit
+exception: it requests both occupancy and semantic products because its job is
+to support an avoidance maneuver, not just answer one uncertainty diagnostic.
 
 A request names the single evidence channel that crossed its uncertainty rule,
 and the response now carries only that product:
@@ -1067,11 +1073,197 @@ The next shadow command should include `--lockstep`:
   --mapping-uncertainty-maturity 1.0
 ```
 
+## September 14 lockstep trigger campaign
+
+This section supersedes the older two-run trigger proposal above. The shadow
+campaign `r11_trigger_shadow_48_v3` ran seeds 20 through 43 in both directions
+under lockstep, using 48 simultaneous simulator instances. Forty-seven traces
+were valid; seed 41 reverse produced no usable pose trace. Spawn collisions at
+less than 20 m route progress are excluded because no approach-time trigger can
+prevent a rover that is placed in contact.
+
+The fixed rule selected before looking at seeds 38 through 43 is:
+
+```text
+8 m forward probe, sampled at 2 Hz
+probe_occ_exposure > 0.04895
+at least 3 hits in the previous 2.0 simulator seconds
+world displacement speed > 0.02 m/s on each counted hit
+```
+
+The speed condition prevents a late request after contact. The rolling hit
+count tolerates one clear lidar sample between uncertain samples; requiring
+strictly consecutive hits discarded real vegetation approaches. The rule is
+not passed through the generic two-second assistance persistence a second
+time, because the rolling condition is already its debounce.
+
+The final frozen metrics are:
+
+| Scoring interpretation | Split | Drag regions | Recall | Requests/run | Unused requests/run | Median lead before stall |
+|---|---|---:|---:|---:|---:|---:|
+| retained 25 m products | seeds 20-37 | 164 | 90.2% | 9.25 | 5.31 | 12.5 s |
+| retained 25 m products | seeds 38-43 | 50 | **86.0%** | 8.09 | 4.36 | **12.1 s** |
+| strict 15 s approach window | seeds 20-37 | 164 | 56.7% | 10.92 | 8.33 | 5.1 s |
+| strict 15 s approach window | seeds 38-43 | 50 | 48.0% | 10.18 | 8.00 | 5.9 s |
+
+"Retained" is the operational measure for a local mapping system: an earlier
+request counts when its retained product lies within 20.5 m of a later stuck
+pose before that stall begins. "Strict" requires the trigger itself to fall in
+the 15 seconds and 12.5 m immediately preceding each stall. Thus the trigger is
+not a perfect point predictor, but it puts a reusable map over 86% of untouched
+validation drag regions with about 12 seconds of median action time.
+
+Reproduce both rows with:
+
+```bash
+python tools/search_stuck_hit_triggers.py \
+  runtime/experiments/r11_trigger_shadow_48_v3 \
+  --validation-seed 38 --retained-products \
+  --candidate 0.04895 2 3 --top 0
+
+python tools/search_stuck_hit_triggers.py \
+  runtime/experiments/r11_trigger_shadow_48_v3 \
+  --validation-seed 38 \
+  --candidate 0.04895 2 3 --top 0
+```
+
+### Live request path
+
+The calibrated probe is now an executable trigger, not only a trace metric.
+It centers the ROI on its uncertain swept cells, raises `forward_probe`, and
+requests a combined occupancy plus semantic product. Loading the result clears
+the rolling episode so stale hits cannot request a duplicate. The map stack
+also removes probe uncertainty already answered by any retained aerial
+occupancy product.
+
+The previous combined product omitted grass from physical occupancy even
+though Gazebo grass has a collision body. Ground-truth rasterization now
+includes grass, bushes, and tree trunks with sub-cell intersection padding.
+Bushes and trunks remain hard occupancy. Grass is deliberately soft: the
+selected probability 0.04 produces fused planner cost 1.2, below the 3.5
+long-range guide/hard-routing threshold. A small live sweep over 0.00, 0.02,
+0.04, 0.06, and 0.08 found 0.04 least disruptive; larger values frequently
+made the planner stop at a dense grass raster rather than traverse or detour.
+
+### Turning a warning into continued motion
+
+A map alone cannot always free a rover whose collision geometry has already
+entered a grass cylinder. Assisted mode therefore has a bounded mapped
+recovery guard: after loss of world-pose mobility and only when an aerial map
+is loaded, it backs for two simulator seconds at 0.6 m/s with 0.65 steering.
+Only one attempt is permitted at a location; recovery rearms after 2 m of
+monotonic route progress. It is disabled in `ground_only` and during assistance
+holds. This gives a mapped rover one chance to leave contact without allowing
+short reverse/forward oscillations to masquerade as route progress.
+
+In a nine-run partial recovery-only cohort over seeds 38-43, common matched
+time windows contained 12 assisted drags versus 18 in the frozen controls, a
+33% reduction. An experimental change that activated the long-range grid guide
+on soft grass produced 6 versus 7 drags in its useful matched windows and also
+caused earlier failures. That guide relaxation was rejected; the original 3.5
+activation threshold remains.
+
+A second ablation increased recovery to 3 s at 1.0 m/s and reduced steering to
+0.4. It was deliberately run on 24 difficult or lagging pairs. At 1.67 matched
+run-hours it had 18 drags versus 19 for the two-second baseline, but only
+5,312 m of route progress versus 5,630 m. It was stopped and rejected:
+suppressing one additional harness intervention did not compensate for less
+actual progress.
+
+The promoted simulator defaults are therefore:
+
+```text
+probe threshold/window/hits       0.04895 / 2.0 s / 3
+probe minimum world speed         0.02 m/s
+population exposure threshold     0.75
+grass occupancy probability       0.04
+mapped recovery                   2.0 s at 0.6 m/s, steering 0.65
+mapped recovery cooldown          3.0 s
+recovery attempts/location        1
+recovery rearm progress           2.0 m
+```
+
+`r11_probe_assisted_recovery_48_v1` is the final operational validation: the
+same 48 seed/direction combinations as the shadow fleet, using the fixed
+trigger, combined maps, soft grass occupancy, and the original repeating
+two-second recovery. It completed all 48 endpoints. Seed 36 forward was
+restarted after a placement collision; comparisons prefer its clean retry.
+The shadow fleet has 47 usable pairs because seed 41 reverse has no control
+pose trace.
+
+| Completed comparison | Ground only | Assisted | Change |
+|---|---:|---:|---:|
+| matched horizon | 7.81 run-hours | 7.81 run-hours | equal horizon |
+| matched drag interventions | 212 | 66 | **-68.9%** |
+| matched route progress | 20,980 m | 21,925 m | **+4.5%** |
+| actual pre-drag map coverage | - | **64/66 (97.0%)** | 9.3 s median lead |
+| endpoint successes | 39/47 | 39/47 | equal |
+| endpoint simulator time | 37,880 s | 34,337 s | -9.4% |
+| endpoint interventions | 271 | 72 | -73.4% |
+
+The complete 48 assisted endpoints made 592 requests (12.33/run): 580
+(98.0%) were raised by `forward_probe`, 11 by mobility fallback, and one by
+the older counterfactual path. The 47-pair common horizons contain 535 of
+those requests. Thus the live map loads and the 97% covered assisted drag
+regions are attributable to the calibrated trigger, not an unrelated fallback.
+
+The equal endpoint success rate also exposed a recovery-policy artifact. The
+repeating baseline made 1,529 recovery attempts over 48 runs; short back-outs
+could reset a displacement clock without gaining route progress. Low harness
+drag count by itself therefore overstates avoidance. The repeating behavior is
+preserved in this frozen campaign but is not the promoted default.
+
+The follow-up `*_hard_v1` campaigns tested the ten slow or failed combinations
+(reverse seeds 22, 25, 26, 29, 32, 33, 34, 37, and 39, plus seed 34 forward)
+with map-only, one-attempt, and two-attempt recovery. Every arm completed all
+ten cases successfully:
+
+| Hard-case endpoint arm | Success | Simulator time | Interventions |
+|---|---:|---:|---:|
+| matched ground controls | 10/10 | 6,829 s | 52 |
+| probe maps, no recovery | 10/10 | 5,588 s | 44 |
+| **probe maps, one attempt/location** | **10/10** | **5,323 s** | **29** |
+| probe maps, two attempts/location | 10/10 | 6,148 s | 46 |
+
+Against the hard ground controls, the selected one-attempt arm reduced matched
+drags from 39 to 29 and increased matched route progress from 3,996 m to
+5,621 m. Its maps covered 27/29 later drag regions (93.1%) with 7.7 s median
+lead; 29/46 recovery attempts moved at least 0.5 m in the next five seconds.
+Against map-only at endpoints, it reduced interventions from 44 to 29 and time
+from 5,588 s to 5,323 s. Two attempts were rejected because they were slower
+and used more interventions than one.
+
+This ablation also exposed a loop-route scoring bug: the controller could stop
+when it passed close to Route 11's endpoint before completing the loop, while
+the harness correctly required 90% route progress. The controller now uses
+the same progress fraction, and affected trials were rerun cleanly. One
+two-attempt seed also received a clean retry after a startup placement
+collision. Every retained run reached an endpoint, and all simulation
+processes were confirmed stopped at 03:26 CDT. The now-unneeded watchdog was
+then stopped, well before both its 03:50 shutdown and the 04:00 testing cutoff.
+
+The live and endpoint comparisons use the same 20 m startup exclusion and
+prefer a clean retry over a longer trial that recorded a placement collision:
+
+```bash
+python tools/compare_drag_campaigns.py \
+  runtime/experiments/r11_trigger_shadow_48_v3 \
+  runtime/experiments/r11_probe_assisted_recovery_48_v1
+```
+
+Besides endpoint success, simulator time, path length, and intervention count,
+the tool reports matched-horizon progress, actual pre-stall map coverage, and
+the fraction of recovery attempts that moved at least 0.5 m before any harness
+drag. These extra checks prevent delayed interventions or recovery dithering
+from being mistaken for successful avoidance.
+
 ## Defaults and cautions
 
-- The CLI and manager defaults are still 0.20 exposure. The 0.75 value has
-  only been an explicit experiment setting and should not become the default
-  until the corrected full run and multi-seed validation are complete.
+- The simulator CLI and experiment runner now default to 0.75 population
+  exposure, as used by the 48-way validation. `AssistanceManager` retains its
+  library-level 0.20 default for compatibility with field-policy callers that
+  construct it directly. The calibrated 0.04895 probe threshold is a separate
+  occupancy fraction and must not be substituted for either value.
 - Cell uncertainty and swept-footprint exposure are separate thresholds.
   Semantic and occupancy cell rules should stay at their Meridian-compatible
   values while the experiment-level exposure threshold is calibrated.

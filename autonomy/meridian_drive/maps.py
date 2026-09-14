@@ -13,6 +13,7 @@ import numpy as np
 # entitled to speak for.
 SEMANTIC_MAP_TYPE = "semantic_traversability"
 OCCUPANCY_MAP_TYPE = "canopy_obstacle"
+COMBINED_MAP_TYPE = "occupancy_and_semantic"
 
 # Maturity state is held as a sorted key array plus its timestamps so lookups
 # are a searchsorted rather than a per-cell dict probe. Cell indices are grid
@@ -240,6 +241,7 @@ class AssistanceEvaluation:
     map_type: str = ""
     decision_relevant: bool = False
     action_relevant: bool = False
+    probe_relevant: bool = False
 
 
 @dataclass(frozen=True)
@@ -477,6 +479,10 @@ class MapStack:
         """Retain local products instead of replacing prior UAV evidence."""
         self.aerial = aerial
         self.aerial_history.append(aerial)
+
+    @property
+    def has_aerial(self) -> bool:
+        return bool(self._aerial_products())
 
     def _aerial_products(self) -> list[UavMap]:
         products = list(self.aerial_history)
@@ -756,6 +762,72 @@ class MapStack:
                 action_relevant=True,
             )
         return max(candidates, key=lambda item: item.uncertainty_exposure)
+
+    def evaluate_probe_assistance(
+        self,
+        trajectory: np.ndarray | None,
+        exposure_threshold: float = 0.02,
+    ) -> AssistanceEvaluation:
+        """Evaluate the fixed-distance corridor used to warn before contact.
+
+        Unlike the population evaluator, this intentionally counts sampled
+        swept-footprint points rather than distinct cells. That exactly
+        matches the shadow-trace metric calibrated against Route-11 drags and
+        preserves a constant warning distance when the selected time-horizon
+        trajectory collapses as the rover slows.
+        """
+        if trajectory is None or len(trajectory) == 0:
+            return AssistanceEvaluation(0.0, None)
+        if (
+            self.ground_occupancy_uncertainty is None
+            and self.ground_obstacle_probability is None
+        ):
+            return AssistanceEvaluation(0.0, None)
+        trajectories = np.asarray(trajectory)
+        if trajectories.ndim == 2:
+            trajectories = trajectories[None, ...]
+        x, y = self._swept_points(trajectories)
+        x = x.reshape(-1)
+        y = y.reshape(-1)
+        unknown = np.ones(x.shape, dtype=bool)
+        ambiguous = np.zeros(x.shape, dtype=bool)
+        high_variance = np.zeros(x.shape, dtype=bool)
+        if self.ground_occupancy_uncertainty is not None:
+            variance, valid = self.ground_occupancy_uncertainty.sample(x, y)
+            known = valid & np.isfinite(variance)
+            high_variance = known & (variance >= 0.04)
+            unknown &= ~known
+        if self.ground_obstacle_probability is not None:
+            probability, valid = self.ground_obstacle_probability.sample(x, y)
+            known = valid & np.isfinite(probability)
+            ambiguous = known & (probability >= 0.20) & (probability <= 0.80)
+            unknown &= ~known
+        uncertain = unknown | ambiguous | high_variance
+        if self._aerial_products():
+            _, _, _, aerial_uncertainty, aerial_valid = self._sample_aerial(
+                x, y, OCCUPANCY_MAP_TYPE
+            )
+            uncertain = np.where(aerial_valid, aerial_uncertainty >= 0.04, uncertain)
+        exposure = float(np.mean(uncertain))
+        if not np.any(uncertain):
+            return AssistanceEvaluation(
+                exposure, None, "lidar_occupancy", COMBINED_MAP_TYPE
+            )
+        selected_x = x[uncertain]
+        selected_y = y[uncertain]
+        roi = (
+            float(np.min(selected_x)),
+            float(np.min(selected_y)),
+            float(np.max(selected_x)),
+            float(np.max(selected_y)),
+        )
+        return AssistanceEvaluation(
+            exposure,
+            roi,
+            "lidar_occupancy",
+            COMBINED_MAP_TYPE,
+            probe_relevant=exposure > exposure_threshold,
+        )
 
     def uncertainty_diagnostics(
         self,

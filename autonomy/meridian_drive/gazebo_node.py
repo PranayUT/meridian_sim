@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import math
 import signal
@@ -21,7 +22,7 @@ from gz.msgs10.world_control_pb2 import WorldControl
 from gz.msgs10.boolean_pb2 import Boolean
 from gz.transport13 import Node
 
-from .assistance import MODES, AssistanceManager
+from .assistance import MODES, AssistanceManager, MappedRecovery
 from .core import MPPI, MppiConfig, Route, rollout
 from .ground_mapping import GroundMapper, SemanticMapper, write_snapshot
 from .maps import AssistanceEvaluation, LocalGridMap, MapStack, TerrainMap
@@ -67,6 +68,25 @@ class GazeboAutonomy:
         self.last_assistance_trace_s = -math.inf
         self.assistance_probe_m = float(args.assistance_probe_m)
         self.last_trace_pose: tuple[float, float, float] | None = None
+        self.probe_uncertainty_threshold = float(
+            args.uav_probe_uncertainty_threshold
+        )
+        self.probe_hit_window_s = float(args.uav_probe_hit_window)
+        self.probe_required_hits = int(args.uav_probe_hits)
+        self.probe_min_world_speed_mps = float(args.uav_probe_min_world_speed)
+        self.probe_hits: deque[tuple[float, AssistanceEvaluation]] = deque()
+        self.mapped_recovery = MappedRecovery(
+            duration_s=args.uav_recovery_duration,
+            speed_mps=args.uav_recovery_speed,
+            steering_fraction=args.uav_recovery_steering,
+            cooldown_s=args.uav_recovery_cooldown,
+            max_attempts_per_location=args.uav_recovery_max_attempts,
+            rearm_progress_m=args.uav_recovery_rearm_progress,
+        )
+        self.last_probe_evaluation = AssistanceEvaluation(0.0, None)
+        self.last_raw_probe_evaluation = AssistanceEvaluation(0.0, None)
+        self.last_probe_world_speed_mps: float | None = None
+        self.last_probe_hit = False
         self.last_map_write_s = 0.0
         self.latest_ground_obstacles: LocalGridMap | None = None
         self.latest_ground_obstacle_probability: LocalGridMap | None = None
@@ -85,6 +105,7 @@ class GazeboAutonomy:
                 args.world_file,
                 args.uav_vegetation_seed,
                 args.uav_resolution,
+                args.uav_grass_occupancy_probability,
             )
         self.assistance = AssistanceManager(
             mode=args.assistance,
@@ -113,6 +134,7 @@ class GazeboAutonomy:
             args.uav_path_uncertainty_threshold
         )
         self.arrival_radius = args.arrival_radius
+        self.arrival_progress_fraction = float(args.arrival_progress_fraction)
         self.lock = threading.Lock()
         self.mapping_lock = threading.Lock()
         self.mapping_event = threading.Event()
@@ -353,14 +375,24 @@ class GazeboAutonomy:
         self.map_stack.ground_semantic_uncertainty = (
             self.latest_ground_semantic_uncertainty
         )
-        if math.hypot(x - self.route.xy[-1, 0], y - self.route.xy[-1, 1]) <= self.arrival_radius:
+        if (
+            math.hypot(x - self.route.xy[-1, 0], y - self.route.xy[-1, 1])
+            <= self.arrival_radius
+            and self.planner.progress_m
+            >= self.arrival_progress_fraction * float(self.route.distance[-1])
+        ):
             if not self.arrived:
                 print("Final route point reached.", flush=True)
             self.arrived = True
             self._zero()
             return
 
-        self.assistance.reload_map()
+        if self.assistance.reload_map():
+            # The retained product answers the rolling episode that requested
+            # it. Do not let the pre-map hit survive fusion long enough to buy
+            # a duplicate product for the same corridor.
+            self.probe_hits.clear()
+            self.last_probe_evaluation = AssistanceEvaluation(0.0, None)
         state = np.asarray((x, y, yaw, speed, self.steer_state), dtype=np.float64)
         # Meridian MPPI consumes the classified local occupancy grid. Feeding
         # raw endpoints here as well double-counts obstacles and mistakes
@@ -391,9 +423,18 @@ class GazeboAutonomy:
             )
             self.last_assistance_s = now_s
         action_evaluation = self.last_action_evaluation
+        trace_due = now_s - self.last_assistance_trace_s >= 0.5
+        probe: np.ndarray | None = None
+        if trace_due:
+            probe_state = np.asarray(
+                (x, y, yaw, speed, self.steer_state), dtype=np.float64
+            )
+            probe = self._forward_probe(probe_state)
+            self._sample_probe_assistance(now_s, (x, y), probe)
+        probe_evaluation = self.last_probe_evaluation
         evaluation = (
-            action_evaluation
-            if action_evaluation.action_relevant
+            probe_evaluation
+            if probe_evaluation.probe_relevant
             else self.last_evaluation
         )
         # Odometry is driven by wheel rotation and remains high when the rover
@@ -415,7 +456,42 @@ class GazeboAutonomy:
         mobility_uncertain = mobility_stalled and action_evaluation.roi is not None
         if mobility_uncertain and not evaluation.action_relevant:
             evaluation = action_evaluation
-        if now_s - self.last_assistance_trace_s >= 0.5:
+        self.assistance.update(
+            evaluation.uncertainty_exposure,
+            evaluation.roi,
+            source=evaluation.source,
+            map_type=evaluation.map_type,
+            decision_relevant=evaluation.decision_relevant,
+            action_relevant=evaluation.action_relevant,
+            probe_relevant=evaluation.probe_relevant,
+            speed_mps=speed,
+            mobility_stalled=mobility_uncertain,
+            sim_time_s=now_s,
+            position_xy=(x, y),
+        )
+        recovery = self.mapped_recovery.update(
+            now_s,
+            stalled=mobility_stalled,
+            progress_m=self.planner.progress_m,
+            enabled=(
+                self.assistance.mode != "ground_only"
+                and self.map_stack.has_aerial
+                and not self.assistance.hold
+            ),
+        )
+        if recovery is not None:
+            command[0], command[1], started = recovery
+            if started:
+                self.planner.nominal.fill(0.0)
+                self.planner.previous.fill(0.0)
+                print(
+                    f"Mapped recovery {self.mapped_recovery.count}: backing out "
+                    f"after {now_s - self.mobility_anchor_s:.1f} s without progress",
+                    flush=True,
+                )
+        if self.assistance.hold:
+            command[:] = 0.0
+        if trace_due:
             self._write_assistance_trace(
                 now_s,
                 (x, y, yaw),
@@ -424,21 +500,9 @@ class GazeboAutonomy:
                 planned,
                 mobility_stalled,
                 action_evaluation,
+                probe,
+                recovery is not None,
             )
-        self.assistance.update(
-            evaluation.uncertainty_exposure,
-            evaluation.roi,
-            source=evaluation.source,
-            map_type=evaluation.map_type,
-            decision_relevant=evaluation.decision_relevant,
-            action_relevant=evaluation.action_relevant,
-            speed_mps=speed,
-            mobility_stalled=mobility_uncertain,
-            sim_time_s=now_s,
-            position_xy=(x, y),
-        )
-        if self.assistance.hold:
-            command[:] = 0.0
 
         model = self.planner.model
         dt = self.planner.config.dt
@@ -562,8 +626,8 @@ class GazeboAutonomy:
             # runs that this controller has not asked for.
             if not any(self._world_control(pause=True) for _ in range(3)):
                 print(
-                    "Could not pause the world for lockstep; the simulator is "
-                    "free-running and the controller may shed ticks.",
+                    "World pause was not acknowledged; continuing lockstep "
+                    "with simulator-clock verification.",
                     flush=True,
                 )
             print(
@@ -651,6 +715,56 @@ class GazeboAutonomy:
             :, 1:
         ]
 
+    def _sample_probe_assistance(
+        self,
+        now_s: float,
+        position_xy: tuple[float, float],
+        probe: np.ndarray | None,
+    ) -> None:
+        """Update the calibrated rolling-hit gate at the trace's 2 Hz cadence."""
+        world_speed: float | None = None
+        if self.last_trace_pose is not None:
+            previous_x, previous_y, previous_s = self.last_trace_pose
+            elapsed = now_s - previous_s
+            if elapsed > 0.0:
+                world_speed = (
+                    math.dist(position_xy, (previous_x, previous_y)) / elapsed
+                )
+            else:
+                self.probe_hits.clear()
+        self.last_trace_pose = (*position_xy, now_s)
+        raw = self.map_stack.evaluate_probe_assistance(
+            probe, self.probe_uncertainty_threshold
+        )
+        while (
+            self.probe_hits
+            and now_s - self.probe_hits[0][0] > self.probe_hit_window_s
+        ):
+            self.probe_hits.popleft()
+        hit = bool(
+            raw.probe_relevant
+            and world_speed is not None
+            and world_speed > self.probe_min_world_speed_mps
+        )
+        if hit:
+            self.probe_hits.append((now_s, raw))
+        if len(self.probe_hits) >= self.probe_required_hits:
+            active = self.probe_hits[-1][1]
+        else:
+            active = AssistanceEvaluation(
+                raw.uncertainty_exposure,
+                raw.roi,
+                raw.source,
+                raw.map_type,
+                raw.decision_relevant,
+                raw.action_relevant,
+                probe_relevant=False,
+            )
+        self.last_raw_probe_evaluation = raw
+        self.last_probe_evaluation = active
+        self.last_probe_world_speed_mps = world_speed
+        self.last_probe_hit = hit
+
     def _write_assistance_trace(
         self,
         now_s: float,
@@ -660,6 +774,8 @@ class GazeboAutonomy:
         population: np.ndarray | None,
         mobility_stalled: bool,
         action_evaluation: AssistanceEvaluation,
+        probe: np.ndarray | None,
+        recovery_active: bool,
     ) -> None:
         """Record every candidate stuck-predictor at a fixed cadence.
 
@@ -670,18 +786,10 @@ class GazeboAutonomy:
         # World speed, unlike wheel odometry, goes to zero when the rover is
         # spinning its wheels against vegetation. The gap between them is the
         # slip that precedes a wedge.
-        world_speed = None
-        if self.last_trace_pose is not None:
-            previous_x, previous_y, previous_s = self.last_trace_pose
-            elapsed = now_s - previous_s
-            if elapsed > 0.0:
-                world_speed = math.dist((x, y), (previous_x, previous_y)) / elapsed
-        self.last_trace_pose = (x, y, now_s)
+        world_speed = self.last_probe_world_speed_mps
         selected = self.planner.best_trajectory()
-        state = np.asarray(
-            (x, y, yaw, wheel_speed, self.steer_state), dtype=np.float64
-        )
-        probe = self._forward_probe(state)
+        raw_probe = self.last_raw_probe_evaluation
+        active_probe = self.last_probe_evaluation
         trace: dict[str, object] = {
             "sim_time_s": now_s,
             "vehicle_xy": [x, y],
@@ -694,6 +802,11 @@ class GazeboAutonomy:
             else max(0.0, abs(wheel_speed) - world_speed),
             "mobility_window_s": now_s - self.mobility_anchor_s,
             "mobility_stalled": bool(mobility_stalled),
+            "mapped_recovery_active": bool(recovery_active),
+            "mapped_recovery_count": self.mapped_recovery.count,
+            "mapped_recovery_location_attempts": (
+                self.mapped_recovery.location_attempts
+            ),
             "population_source": self.last_evaluation.source,
             "population_exposure": self.last_evaluation.uncertainty_exposure,
             "population_decision_relevant": bool(
@@ -704,6 +817,14 @@ class GazeboAutonomy:
             "action_relevant": bool(action_evaluation.action_relevant),
             "action_roi": list(action_evaluation.roi)
             if action_evaluation.roi is not None
+            else None,
+            "probe_source": raw_probe.source,
+            "probe_trigger_exposure": raw_probe.uncertainty_exposure,
+            "probe_hit": self.last_probe_hit,
+            "probe_hit_count": len(self.probe_hits),
+            "probe_relevant": bool(active_probe.probe_relevant),
+            "probe_roi": list(active_probe.roi)
+            if active_probe.roi is not None
             else None,
             "assistance_state": self.assistance.state,
             "retained_uav_products": len(self.map_stack.aerial_history),
@@ -739,7 +860,7 @@ def parse_args() -> argparse.Namespace:
         "--uav-source", choices=("ground_truth", "file"), default="ground_truth",
         help="generate exact simulator maps or wait for an external NPZ producer",
     )
-    parser.add_argument("--uav-uncertainty-threshold", type=float, default=0.20)
+    parser.add_argument("--uav-uncertainty-threshold", type=float, default=0.75)
     parser.add_argument(
         "--uav-path-uncertainty-threshold",
         type=float,
@@ -775,6 +896,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--speed-max", type=float, default=2.2)
     # Matches the harness default; see tools/run_experiment.py.
     parser.add_argument("--arrival-radius", type=float, default=1.0)
+    parser.add_argument("--arrival-progress-fraction", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--odometry-topic", default="/model/hill_rover/odometry")
     parser.add_argument("--world-pose-topic", default="/world/hill_country/dynamic_pose/info")
@@ -794,6 +916,42 @@ def parse_args() -> argparse.Namespace:
         default=8.0,
         help="fixed forward distance measured by the trace corridor probe",
     )
+    parser.add_argument(
+        "--uav-probe-uncertainty-threshold",
+        type=float,
+        default=0.04895,
+        help="occupancy uncertainty fraction counted as one forward-probe hit",
+    )
+    parser.add_argument(
+        "--uav-probe-hit-window",
+        type=float,
+        default=2.0,
+        help="simulator seconds over which forward-probe hits accumulate",
+    )
+    parser.add_argument(
+        "--uav-probe-hits",
+        type=int,
+        default=3,
+        help="forward-probe hits required before the request activates",
+    )
+    parser.add_argument(
+        "--uav-probe-min-world-speed",
+        type=float,
+        default=0.02,
+        help="minimum measured displacement speed for a probe sample to count",
+    )
+    parser.add_argument(
+        "--uav-grass-occupancy-probability",
+        type=float,
+        default=0.04,
+        help="soft occupancy probability assigned to physical grass bodies",
+    )
+    parser.add_argument("--uav-recovery-duration", type=float, default=2.0)
+    parser.add_argument("--uav-recovery-speed", type=float, default=0.6)
+    parser.add_argument("--uav-recovery-steering", type=float, default=0.65)
+    parser.add_argument("--uav-recovery-cooldown", type=float, default=3.0)
+    parser.add_argument("--uav-recovery-max-attempts", type=int, default=1)
+    parser.add_argument("--uav-recovery-rearm-progress", type=float, default=2.0)
     parser.add_argument("--command-topic", default="/model/hill_rover/cmd_vel")
     parser.add_argument(
         "--terrain-dem",
@@ -821,10 +979,32 @@ def parse_args() -> argparse.Namespace:
         parser.error("samples must be at least 8 and horizon must be at least 2")
     if args.target_speed <= 0.0 or args.speed_max < args.target_speed:
         parser.error("speed limits must be positive and speed-max must include target-speed")
+    if args.arrival_radius <= 0.0:
+        parser.error("arrival-radius must be positive")
+    if not 0.0 <= args.arrival_progress_fraction <= 1.0:
+        parser.error("arrival-progress-fraction must be between 0 and 1")
     if not 0.0 <= args.uav_uncertainty_threshold <= 1.0:
         parser.error("uav-uncertainty-threshold must be between 0 and 1")
     if not 0.0 <= args.uav_path_uncertainty_threshold <= 1.0:
         parser.error("uav-path-uncertainty-threshold must be between 0 and 1")
+    if not 0.0 <= args.uav_probe_uncertainty_threshold <= 1.0:
+        parser.error("uav-probe-uncertainty-threshold must be between 0 and 1")
+    if args.uav_probe_hit_window < 0.5:
+        parser.error("uav-probe-hit-window must be at least the 0.5 s sample period")
+    if args.uav_probe_hits < 1:
+        parser.error("uav-probe-hits must be positive")
+    if args.uav_probe_min_world_speed < 0.0:
+        parser.error("uav-probe-min-world-speed must be non-negative")
+    if not 0.0 <= args.uav_grass_occupancy_probability <= 1.0:
+        parser.error("uav-grass-occupancy-probability must be between 0 and 1")
+    if min(args.uav_recovery_duration, args.uav_recovery_speed, args.uav_recovery_cooldown) < 0.0:
+        parser.error("uav recovery timing and speed must be non-negative")
+    if not 0.0 <= args.uav_recovery_steering <= 1.0:
+        parser.error("uav-recovery-steering must be between 0 and 1")
+    if args.uav_recovery_max_attempts < 1:
+        parser.error("uav-recovery-max-attempts must be positive")
+    if args.uav_recovery_rearm_progress < 0.0:
+        parser.error("uav-recovery-rearm-progress must be non-negative")
     if args.assistance_period < 0.0:
         parser.error("assistance-period may not be negative")
     if args.mapping_uncertainty_maturity < 0.0:

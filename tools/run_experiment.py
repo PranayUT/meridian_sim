@@ -126,6 +126,14 @@ def reset_world() -> bool:
     return gz_service(f"/world/{WORLD}/control", "reset: {all: true}", "gz.msgs.WorldControl")
 
 
+def pause_world() -> bool:
+    return gz_service(
+        f"/world/{WORLD}/control",
+        "pause: true",
+        "gz.msgs.WorldControl",
+    )
+
+
 def place(x: float, y: float, z: float, yaw: float) -> bool:
     request = (
         f'name: "{MODEL}", position: {{x: {x}, y: {y}, z: {z}}}, '
@@ -283,6 +291,10 @@ def run_trial(
         # trial's world in place, which quietly changes what this trial measures.
         print("    warning: world reset did not confirm; continuing", flush=True)
     time.sleep(1.0)
+    if args.lockstep and not pause_world():
+        # A late request commonly lands even when discovery loses its reply.
+        # The autonomy node verifies and repeats the pause before it steps.
+        print("    warning: initial world pause did not confirm; continuing", flush=True)
     height = terrain_height(terrain, start[0], start[1])
     start_z = (height + args.ride_height) if height is not None else args.fallback_z
     if not place(start[0], start[1], start_z, heading):
@@ -306,9 +318,23 @@ def run_trial(
         "--uav-map", str(args.run_dir / "uav_map.npz"),
         "--seed", str(trial.seed),
         "--arrival-radius", str(args.arrival_radius),
+        "--arrival-progress-fraction", str(args.min_route_progress),
         "--ground-map", str(args.run_dir / "ground_maps.npz"),
         "--assistance-trace", str(args.run_dir / "assistance_trace.jsonl"),
         "--assistance-probe-m", str(args.assistance_probe_m),
+        "--uav-probe-uncertainty-threshold",
+        str(args.uav_probe_uncertainty_threshold),
+        "--uav-probe-hit-window", str(args.uav_probe_hit_window),
+        "--uav-probe-hits", str(args.uav_probe_hits),
+        "--uav-probe-min-world-speed", str(args.uav_probe_min_world_speed),
+        "--uav-grass-occupancy-probability",
+        str(args.uav_grass_occupancy_probability),
+        "--uav-recovery-duration", str(args.uav_recovery_duration),
+        "--uav-recovery-speed", str(args.uav_recovery_speed),
+        "--uav-recovery-steering", str(args.uav_recovery_steering),
+        "--uav-recovery-cooldown", str(args.uav_recovery_cooldown),
+        "--uav-recovery-max-attempts", str(args.uav_recovery_max_attempts),
+        "--uav-recovery-rearm-progress", str(args.uav_recovery_rearm_progress),
         "--status", str(args.run_dir / "autonomy_status.json"),
         "--uav-request", str(args.run_dir / "uav_request.json"),
         "--no-visualization",
@@ -452,6 +478,18 @@ def run_trial(
         "uav_requests": uav_requests,
         "assistance": args.assistance,
         "uav_uncertainty_threshold": args.uav_uncertainty_threshold,
+        "uav_path_uncertainty_threshold": args.uav_path_uncertainty_threshold,
+        "uav_probe_uncertainty_threshold": args.uav_probe_uncertainty_threshold,
+        "uav_probe_hit_window": args.uav_probe_hit_window,
+        "uav_probe_hits": args.uav_probe_hits,
+        "uav_probe_min_world_speed": args.uav_probe_min_world_speed,
+        "uav_grass_occupancy_probability": args.uav_grass_occupancy_probability,
+        "uav_recovery_duration": args.uav_recovery_duration,
+        "uav_recovery_speed": args.uav_recovery_speed,
+        "uav_recovery_steering": args.uav_recovery_steering,
+        "uav_recovery_cooldown": args.uav_recovery_cooldown,
+        "uav_recovery_max_attempts": args.uav_recovery_max_attempts,
+        "uav_recovery_rearm_progress": args.uav_recovery_rearm_progress,
         "mapping_uncertainty_maturity": args.mapping_uncertainty_maturity,
         "veg_seed": trial.veg_seed,
     }
@@ -471,10 +509,21 @@ def main() -> int:
         default="ground_only",
     )
     parser.add_argument("--uav-source", choices=("ground_truth", "file"), default="ground_truth")
-    parser.add_argument("--uav-uncertainty-threshold", type=float, default=0.20)
+    parser.add_argument("--uav-uncertainty-threshold", type=float, default=0.75)
     parser.add_argument("--uav-path-uncertainty-threshold", type=float, default=0.20)
     parser.add_argument("--assistance-probe-m", type=float, default=8.0,
                         help="forward distance measured by the trace corridor probe")
+    parser.add_argument("--uav-probe-uncertainty-threshold", type=float, default=0.04895)
+    parser.add_argument("--uav-probe-hit-window", type=float, default=2.0)
+    parser.add_argument("--uav-probe-hits", type=int, default=3)
+    parser.add_argument("--uav-probe-min-world-speed", type=float, default=0.02)
+    parser.add_argument("--uav-grass-occupancy-probability", type=float, default=0.04)
+    parser.add_argument("--uav-recovery-duration", type=float, default=2.0)
+    parser.add_argument("--uav-recovery-speed", type=float, default=0.6)
+    parser.add_argument("--uav-recovery-steering", type=float, default=0.65)
+    parser.add_argument("--uav-recovery-cooldown", type=float, default=3.0)
+    parser.add_argument("--uav-recovery-max-attempts", type=int, default=1)
+    parser.add_argument("--uav-recovery-rearm-progress", type=float, default=2.0)
     parser.add_argument("--mapping-uncertainty-maturity", type=float, default=1.0)
     parser.add_argument("--assistance-period", type=float, default=0.0,
                         help="seconds between assistance evaluations; 0 evaluates every tick")
@@ -516,6 +565,24 @@ def main() -> int:
         parser.error("uav-uncertainty-threshold must be between 0 and 1")
     if not 0.0 <= args.uav_path_uncertainty_threshold <= 1.0:
         parser.error("uav-path-uncertainty-threshold must be between 0 and 1")
+    if not 0.0 <= args.uav_probe_uncertainty_threshold <= 1.0:
+        parser.error("uav-probe-uncertainty-threshold must be between 0 and 1")
+    if args.uav_probe_hit_window < 0.5:
+        parser.error("uav-probe-hit-window must be at least 0.5 s")
+    if args.uav_probe_hits < 1:
+        parser.error("uav-probe-hits must be positive")
+    if args.uav_probe_min_world_speed < 0.0:
+        parser.error("uav-probe-min-world-speed must be non-negative")
+    if not 0.0 <= args.uav_grass_occupancy_probability <= 1.0:
+        parser.error("uav-grass-occupancy-probability must be between 0 and 1")
+    if min(args.uav_recovery_duration, args.uav_recovery_speed, args.uav_recovery_cooldown) < 0.0:
+        parser.error("uav recovery timing and speed must be non-negative")
+    if not 0.0 <= args.uav_recovery_steering <= 1.0:
+        parser.error("uav-recovery-steering must be between 0 and 1")
+    if args.uav_recovery_max_attempts < 1:
+        parser.error("uav-recovery-max-attempts must be positive")
+    if args.uav_recovery_rearm_progress < 0.0:
+        parser.error("uav-recovery-rearm-progress must be non-negative")
     if args.mapping_uncertainty_maturity < 0.0:
         parser.error("mapping-uncertainty-maturity must be non-negative")
 
@@ -552,12 +619,18 @@ def main() -> int:
 
     results_path = args.results or (args.run_dir / "campaign.csv")
     results_path.parent.mkdir(parents=True, exist_ok=True)
-    columns = ["cycle", "seed", "route", "direction", "outcome", "success",
-               "sim_time_s", "wall_time_s", "path_length_m", "route_length_m",
-               "interventions", "interventions_resolved", "route_progress_m",
-               "uav_requests",
-               "assistance", "uav_uncertainty_threshold",
-               "mapping_uncertainty_maturity", "veg_seed"]
+    columns = [
+        "cycle", "seed", "route", "direction", "outcome", "success",
+        "sim_time_s", "wall_time_s", "path_length_m", "route_length_m",
+        "interventions", "interventions_resolved", "route_progress_m",
+        "uav_requests", "assistance", "uav_uncertainty_threshold",
+        "uav_path_uncertainty_threshold", "uav_probe_uncertainty_threshold",
+        "uav_probe_hit_window", "uav_probe_hits", "uav_probe_min_world_speed",
+        "uav_grass_occupancy_probability", "uav_recovery_duration",
+        "uav_recovery_speed", "uav_recovery_steering",
+        "uav_recovery_cooldown", "uav_recovery_max_attempts",
+        "uav_recovery_rearm_progress", "mapping_uncertainty_maturity", "veg_seed",
+    ]
     rows: list[dict] = []
     stop = False
 

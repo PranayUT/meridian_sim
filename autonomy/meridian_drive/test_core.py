@@ -10,10 +10,11 @@ from pathlib import Path
 
 import numpy as np
 
-from autonomy.meridian_drive.assistance import AssistanceManager
+from autonomy.meridian_drive.assistance import AssistanceManager, MappedRecovery
 from autonomy.meridian_drive.core import MPPI, MppiConfig, Route, VehicleModel, rollout
 from autonomy.meridian_drive.ground_mapping import SemanticMapper
 from autonomy.meridian_drive.maps import (
+    COMBINED_MAP_TYPE,
     OCCUPANCY_MAP_TYPE,
     SEMANTIC_MAP_TYPE,
     LocalGridMap,
@@ -39,6 +40,28 @@ from tools.vegetation import Plant
 
 
 class DynamicsTests(unittest.TestCase):
+    def test_mapped_recovery_backs_out_then_observes_cooldown(self) -> None:
+        recovery = MappedRecovery(
+            duration_s=2.0,
+            speed_mps=0.6,
+            steering_fraction=0.65,
+            cooldown_s=3.0,
+            max_attempts_per_location=2,
+        )
+        self.assertIsNone(
+            recovery.update(4.0, stalled=True, enabled=False, progress_m=0.0)
+        )
+        self.assertEqual(recovery.update(5.0, stalled=True, enabled=True), (-0.6, 0.65, True))
+        self.assertEqual(recovery.update(6.0, stalled=False, enabled=True), (-0.6, 0.65, False))
+        self.assertIsNone(recovery.update(7.0, stalled=True, enabled=True))
+        self.assertIsNone(recovery.update(9.9, stalled=True, enabled=True))
+        self.assertEqual(recovery.update(10.0, stalled=True, enabled=True), (-0.6, -0.65, True))
+        self.assertIsNone(recovery.update(15.0, stalled=True, enabled=True))
+        self.assertEqual(
+            recovery.update(16.0, stalled=True, enabled=True, progress_m=2.0),
+            (-0.6, 0.65, True),
+        )
+
     def test_ackermann_inside_wheel_is_limited_to_45_degrees(self) -> None:
         model = VehicleModel()
         track_width = 0.34
@@ -761,6 +784,43 @@ class MapTests(unittest.TestCase):
                 trigger_history["triggers"][0]["trigger_kind"], "mobility"
             )
 
+    def test_forward_probe_is_recorded_as_its_own_trigger(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = AssistanceManager(
+                "counterfactual_uav",
+                root / "map.npz",
+                root / "request.json",
+                root / "status.json",
+                MapStack(),
+                uncertainty_threshold=0.75,
+                persistence_s=100.0,
+                stop_settle_s=0.0,
+            )
+            update = {
+                "source": "lidar_occupancy",
+                "map_type": COMBINED_MAP_TYPE,
+                "probe_relevant": True,
+                "speed_mps": 0.0,
+            }
+            manager.update(0.03, (1.0, 2.0, 5.0, 6.0), **update)
+            manager.update(0.03, (1.0, 2.0, 5.0, 6.0), **update)
+
+            trigger_history = json.loads(
+                (root / "request_trigger_history.json").read_text()
+            )
+            request = json.loads((root / "request.json").read_text())
+            self.assertEqual(
+                trigger_history["triggers"][0]["trigger_kind"], "forward_probe"
+            )
+            status = json.loads((root / "status.json").read_text())
+            self.assertTrue(status["probe_relevant"])
+            self.assertTrue(request["probe_relevant"])
+            self.assertEqual(
+                set(request["map_types"]),
+                {OCCUPANCY_MAP_TYPE, SEMANTIC_MAP_TYPE},
+            )
+
     def test_ground_truth_uav_writes_occupancy_and_goose_labels(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "uav.npz"
@@ -773,7 +833,11 @@ class MapTests(unittest.TestCase):
                 ],
                 [LabeledEllipse(0.0, 2.0, 0.8, 0.5, 0.0, 40)],
             )
-            producer((-12.5, -12.5, 12.5, 12.5), 3)
+            producer(
+                (-12.5, -12.5, 12.5, 12.5),
+                3,
+                COMBINED_MAP_TYPE,
+            )
             with np.load(path, allow_pickle=False) as archive:
                 self.assertEqual(archive["occupancy"].shape, (100, 100))
                 self.assertEqual(archive["semantic_label"].shape, (100, 100))
@@ -783,8 +847,22 @@ class MapTests(unittest.TestCase):
                 self.assertIn(50, archive["semantic_label"])
                 self.assertGreater(np.count_nonzero(archive["occupancy"]), 0)
                 self.assertEqual(int(archive["sequence"]), 3)
+                self.assertEqual(
+                    set(archive["map_types"].tolist()),
+                    {OCCUPANCY_MAP_TYPE, SEMANTIC_MAP_TYPE},
+                )
             layer = load_uav_map(path)
             self.assertEqual(layer.shape, (100, 100))
+            _, grass_obstacle, _, grass_valid = layer.sample(
+                np.asarray([-2.0]), np.asarray([0.0])
+            )
+            self.assertTrue(bool(grass_valid[0]))
+            self.assertAlmostEqual(float(grass_obstacle[0]), 0.04, places=6)
+            grass_cost, grass_collision = MapStack(aerial=layer).cost(
+                np.asarray([-2.0]), np.asarray([0.0])
+            )
+            self.assertAlmostEqual(float(grass_cost[0]), 1.2, places=5)
+            self.assertFalse(bool(grass_collision[0]))
 
     def test_ground_truth_uav_delivers_only_the_requested_product(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1041,6 +1119,42 @@ class UncertaintyDiagnosticsTest(unittest.TestCase):
         # The blocked patch sits about 2.5 m ahead of the origin.
         self.assertEqual(diagnostics["path_occ_blocked_frac"], 0.0)
         self.assertGreater(diagnostics["probe_occ_blocked_frac"], 0.0)
+
+    def test_probe_evaluator_matches_the_calibrated_trace_metric(self) -> None:
+        stack = self._stack()
+        probe = self._straight(8.0)
+        probe[:, 1] = 3.8
+        diagnostics = stack.uncertainty_diagnostics(
+            None, None, probe, (0.0, 0.0), 1.0
+        )
+        evaluation = stack.evaluate_probe_assistance(probe, 0.02)
+
+        self.assertAlmostEqual(
+            evaluation.uncertainty_exposure,
+            diagnostics["probe_occ_exposure"],
+        )
+        self.assertTrue(evaluation.probe_relevant)
+        self.assertIsNotNone(evaluation.roi)
+        self.assertEqual(evaluation.map_type, COMBINED_MAP_TYPE)
+
+        clear = np.zeros((4, 11), dtype=np.float32)
+        stack.add_aerial(
+            UavMap(
+                clear,
+                clear,
+                clear,
+                clear,
+                -1.0,
+                2.0,
+                1.0,
+                1,
+                (OCCUPANCY_MAP_TYPE,),
+            )
+        )
+        answered = stack.evaluate_probe_assistance(probe, 0.02)
+        self.assertEqual(answered.uncertainty_exposure, 0.0)
+        self.assertFalse(answered.probe_relevant)
+        self.assertIsNone(answered.roi)
 
     def test_unknown_evidence_separates_from_ambiguous_evidence(self) -> None:
         stack = self._stack()
