@@ -308,6 +308,7 @@ def run_trial(
     command = [
         sys.executable, "-m", "autonomy.meridian_drive.gazebo_node",
         "--route-file", str(trial.route_file),
+        "--planner", args.planner,
         "--assistance", args.assistance,
         "--uav-source", args.uav_source,
         "--uav-uncertainty-threshold", str(args.uav_uncertainty_threshold),
@@ -476,6 +477,7 @@ def run_trial(
         "interventions_resolved": resolved,
         "route_progress_m": round(route_progress_m, 2),
         "uav_requests": uav_requests,
+        "planner": args.planner,
         "assistance": args.assistance,
         "uav_uncertainty_threshold": args.uav_uncertainty_threshold,
         "uav_path_uncertainty_threshold": args.uav_path_uncertainty_threshold,
@@ -503,6 +505,12 @@ def main() -> int:
                         default=["forward", "reverse"],
                         help="run a subset so long routes can be split across sittings")
     parser.add_argument("--seed", type=int, default=7, help="seed of the first cycle")
+    parser.add_argument(
+        "--planner",
+        choices=("meridian_mppi", "gp_navigation"),
+        default="meridian_mppi",
+        help="local navigation planner under test",
+    )
     parser.add_argument(
         "--assistance",
         choices=(
@@ -628,7 +636,7 @@ def main() -> int:
         "cycle", "seed", "route", "direction", "outcome", "success",
         "sim_time_s", "wall_time_s", "path_length_m", "route_length_m",
         "interventions", "interventions_resolved", "route_progress_m",
-        "uav_requests", "assistance", "uav_uncertainty_threshold",
+        "uav_requests", "planner", "assistance", "uav_uncertainty_threshold",
         "uav_path_uncertainty_threshold", "uav_probe_uncertainty_threshold",
         "uav_probe_hit_window", "uav_probe_hits", "uav_probe_min_world_speed",
         "uav_grass_occupancy_probability", "uav_recovery_duration",

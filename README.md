@@ -312,6 +312,15 @@ for the route-wide optimistic baseline:
 ./scripts/run_experiment.sh --cycles 5 --rtf 3
 ```
 
+Select GP-Navigation for the same campaign harness with `--planner
+gp_navigation`. For example, a single forward Route 11 ground-only trial is:
+
+```bash
+./scripts/run_experiment.sh --routes Route-11 --directions forward \
+  --cycles 1 --seed 7 --rtf 1 --planner gp_navigation \
+  --assistance ground_only
+```
+
 Defaults to Route-11, Route-12, and Route-13 from `paths/from_truck/` for six
 trials per cycle; reversed copies are generated into `runtime/experiment_routes/`.
 When the rover makes no progress for `--stuck-s` seconds of simulator time the
