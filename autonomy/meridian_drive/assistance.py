@@ -19,7 +19,13 @@ from .maps import (
     load_uav_map,
 )
 
-MODES = ("ground_only", "greedy_uav", "counterfactual_uav", "always_on_uav")
+MODES = (
+    "ground_only",
+    "greedy_uav",
+    "counterfactual_uav",
+    "explore_then_drive",
+    "always_on_uav",
+)
 
 
 @dataclass
@@ -224,12 +230,17 @@ class AssistanceManager:
                 self._write_status(exposure)
                 return
 
-        # The always-on arm is an optimistic information baseline, not a
-        # request policy. GazeboAutonomy installs one exact route-wide product
-        # before the first control tick, so residual or out-of-bounds
-        # uncertainty must never turn into a reactive request here.
-        if self.mode == "always_on_uav":
-            self.detail = "route-wide aerial evidence is continuously fused"
+        # These route-wide arms are information baselines, not request
+        # policies. GazeboAutonomy installs one exact product before the first
+        # control tick, so residual or out-of-bounds uncertainty must never
+        # turn into a reactive request here. The campaign harness separately
+        # charges explore_then_drive for its pre-drive survey time.
+        if self.mode in ("explore_then_drive", "always_on_uav"):
+            self.detail = (
+                "route-wide aerial survey was fused before driving"
+                if self.mode == "explore_then_drive"
+                else "route-wide aerial evidence is continuously fused"
+            )
             if now - self._last_status_s >= 0.5:
                 self._write_status(exposure)
                 self._last_status_s = now

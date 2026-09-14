@@ -120,7 +120,7 @@ class GazeboMarkers:
                     self.reported_failure = True
                 self.next_retry_s = now + 2.0
                 return
-            print("Gazebo route and MPPI visualization active.", flush=True)
+            print("Gazebo route and planner trajectory visualization active.", flush=True)
         if best_trajectory is None or now < self.next_rollout_s:
             return
         xy = np.asarray(best_trajectory[:, :2], dtype=np.float64)

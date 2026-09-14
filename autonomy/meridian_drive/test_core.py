@@ -35,11 +35,38 @@ from autonomy.meridian_drive.obstacle_grid_logic import (
 )
 from autonomy.meridian_drive.routes import load_route
 from autonomy.meridian_drive.uav_ground_truth import GroundTruthUav, LabeledEllipse
-from tools.run_experiment import drag_target
+from tools.run_experiment import (
+    PX4_MISSION_CRUISE_SPEED_MPS,
+    drag_target,
+    estimate_uav_usage,
+    route_coverage_distance_m,
+)
 from tools.vegetation import Plant
 
 
 class DynamicsTests(unittest.TestCase):
+    def test_analytical_uav_flight_accounting(self) -> None:
+        route = Route.from_waypoints([(0.0, 0.0), (50.0, 0.0)])
+        self.assertEqual(PX4_MISSION_CRUISE_SPEED_MPS, 5.0)
+        self.assertAlmostEqual(route_coverage_distance_m(route, 25.0), 75.0)
+
+        explored = estimate_uav_usage(
+            "explore_then_drive", route, 100.0, 0, 25.0
+        )
+        self.assertEqual(explored["uav_flight_time_s"], 15.0)
+        self.assertEqual(explored["total_navigation_time_s"], 115.0)
+        self.assertEqual(explored["uav_survey_distance_m"], 75.0)
+
+        counterfactual = estimate_uav_usage(
+            "counterfactual_uav", route, 100.0, 3, 25.0
+        )
+        self.assertEqual(counterfactual["uav_flight_time_s"], 15.0)
+        self.assertEqual(counterfactual["total_navigation_time_s"], 115.0)
+
+        greedy = estimate_uav_usage("greedy_uav", route, 100.0, 4, 25.0)
+        self.assertEqual(greedy["uav_flight_time_s"], 100.0)
+        self.assertEqual(greedy["total_navigation_time_s"], 100.0)
+
     def test_mapped_recovery_backs_out_then_observes_cooldown(self) -> None:
         recovery = MappedRecovery(
             duration_s=2.0,
@@ -987,45 +1014,46 @@ class MapTests(unittest.TestCase):
             self.assertIsNone(stack.aerial)
             self.assertFalse(manager.reload_map())
 
-    def test_always_on_uav_never_requests_or_holds(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            stack = MapStack()
-            map_path = root / "map.npz"
-            manager = AssistanceManager(
-                "always_on_uav",
-                map_path,
-                root / "request.json",
-                root / "status.json",
-                stack,
-                persistence_s=0.0,
-            )
-            np.savez_compressed(
-                map_path,
-                cost=np.zeros((2, 2), dtype=np.float32),
-                obstacle=np.zeros((2, 2), dtype=np.float32),
-                uncertainty=np.zeros((2, 2), dtype=np.float32),
-                map_types=np.asarray((SEMANTIC_MAP_TYPE, OCCUPANCY_MAP_TYPE)),
-                origin_xy=np.asarray((0.0, 0.0)),
-                resolution=np.asarray(1.0),
-                sequence=np.asarray(1),
-            )
-            self.assertTrue(manager.reload_map())
+    def test_route_wide_uav_modes_never_request_or_hold(self) -> None:
+        for mode in ("explore_then_drive", "always_on_uav"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                stack = MapStack()
+                map_path = root / "map.npz"
+                manager = AssistanceManager(
+                    mode,
+                    map_path,
+                    root / "request.json",
+                    root / "status.json",
+                    stack,
+                    persistence_s=0.0,
+                )
+                np.savez_compressed(
+                    map_path,
+                    cost=np.zeros((2, 2), dtype=np.float32),
+                    obstacle=np.zeros((2, 2), dtype=np.float32),
+                    uncertainty=np.zeros((2, 2), dtype=np.float32),
+                    map_types=np.asarray((SEMANTIC_MAP_TYPE, OCCUPANCY_MAP_TYPE)),
+                    origin_xy=np.asarray((0.0, 0.0)),
+                    resolution=np.asarray(1.0),
+                    sequence=np.asarray(1),
+                )
+                self.assertTrue(manager.reload_map())
 
-            manager.update(
-                1.0,
-                (0.0, 0.0, 5.0, 5.0),
-                source="lidar_occupancy",
-                map_type=OCCUPANCY_MAP_TYPE,
-                decision_relevant=True,
-                action_relevant=True,
-                mobility_stalled=True,
-            )
+                manager.update(
+                    1.0,
+                    (0.0, 0.0, 5.0, 5.0),
+                    source="lidar_occupancy",
+                    map_type=OCCUPANCY_MAP_TYPE,
+                    decision_relevant=True,
+                    action_relevant=True,
+                    mobility_stalled=True,
+                )
 
-            self.assertFalse(manager.hold)
-            self.assertFalse((root / "request.json").exists())
-            self.assertEqual(manager._request_count, 0)
-            self.assertEqual(len(stack.aerial_history), 1)
+                self.assertFalse(manager.hold)
+                self.assertFalse((root / "request.json").exists())
+                self.assertEqual(manager._request_count, 0)
+                self.assertEqual(len(stack.aerial_history), 1)
 
 
 class AerialSamplingTest(unittest.TestCase):

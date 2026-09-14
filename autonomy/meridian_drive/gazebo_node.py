@@ -22,6 +22,8 @@ from gz.msgs10.world_control_pb2 import WorldControl
 from gz.msgs10.boolean_pb2 import Boolean
 from gz.transport13 import Node
 
+from autonomy.gp_navigation import GPNavigationConfig, GPNavigationPlanner
+
 from .assistance import MODES, AssistanceManager, MappedRecovery
 from .core import MPPI, MppiConfig, Route, rollout
 from .ground_mapping import GroundMapper, SemanticMapper, write_snapshot
@@ -53,13 +55,31 @@ class GazeboAutonomy:
         self.route_anchors = np.asarray(waypoints, dtype=np.float64)
         self.route = Route.from_waypoints(waypoints)
         self.route_name = args.route_file.name if args.route_file else "built-in route"
-        config = MppiConfig(
-            samples=args.samples,
-            horizon=args.horizon,
-            target_speed=args.target_speed,
-            speed_max=args.speed_max,
-        )
-        self.planner = MPPI(self.route, config=config, seed=args.seed)
+        self.planner_kind = args.planner
+        if args.planner == "gp_navigation":
+            gp_config = GPNavigationConfig(
+                resolution=args.gp_resolution,
+                radius=args.gp_radius,
+                inducing_points=args.gp_inducing_points,
+                step_len=args.gp_step_len,
+                iter_max=args.gp_iterations,
+                traversability_limit=args.gp_traversability_limit,
+                replan_period_s=args.gp_replan_period,
+                target_speed=args.target_speed,
+                speed_max=args.speed_max,
+                horizon=args.horizon,
+            )
+            self.planner = GPNavigationPlanner(
+                self.route, config=gp_config, seed=args.seed
+            )
+        else:
+            config = MppiConfig(
+                samples=args.samples,
+                horizon=args.horizon,
+                target_speed=args.target_speed,
+                speed_max=args.speed_max,
+            )
+            self.planner = MPPI(self.route, config=config, seed=args.seed)
         terrain = TerrainMap.from_tif(args.terrain_dem) if args.terrain_dem else None
         self.map_stack = MapStack(
             terrain=terrain,
@@ -124,11 +144,13 @@ class GazeboAutonomy:
             request_handler=ground_truth_uav,
             clock=self.now,
         )
-        if args.assistance == "always_on_uav":
-            # This is an oracle-information upper bound: keep the equivalent
-            # of a 25 m local UAV view around every route point available from
-            # the first planner tick onward. Align outward to raster cells so
-            # the generated map cannot lose its far edge to rounding.
+        if args.assistance in ("explore_then_drive", "always_on_uav"):
+            # Both route-wide arms expose the same information to the UGV.
+            # explore_then_drive is charged for a sequential lawnmower survey
+            # by the campaign harness; always_on_uav remains an oracle upper
+            # bound. Keep the equivalent of a local UAV view around every
+            # route point available from the first planner tick onward. Align
+            # outward to raster cells so rounding cannot lose the far edge.
             assert ground_truth_uav is not None
             padding = args.uav_map_size / 2.0
             resolution = args.uav_resolution
@@ -145,13 +167,15 @@ class GazeboAutonomy:
                 * resolution,
             )
             # The combined product contains both evidence channels. Unlike
-            # reactive assistance, this proactive baseline has no request
-            # count, stop, wait, or fusion-settling penalty.
+            # reactive assistance, these proactive baselines have no request
+            # count, stop, wait, or fusion-settling state in the controller.
             ground_truth_uav(roi, 1, COMBINED_MAP_TYPE)
             if not self.assistance.reload_map(force=True):
-                raise RuntimeError("could not load the always-on UAV baseline map")
+                raise RuntimeError("could not load the route-wide UAV baseline map")
             self.assistance.detail = (
-                "route-wide occupancy and semantic aerial evidence loaded"
+                "route-wide occupancy and semantic aerial survey loaded"
+                if args.assistance == "explore_then_drive"
+                else "route-wide occupancy and semantic aerial evidence loaded"
             )
         # Assistance evaluation is the most expensive thing in the control
         # tick. It runs every tick by default so the counterfactual sees the
@@ -329,6 +353,8 @@ class GazeboAutonomy:
             if lidar is not None and now_s - last_lidar_s >= 0.095:
                 xyz, sensor_xyz, ground_z, scan_s = lidar
                 self.ground_mapper.update(xyz, sensor_xyz, ground_z, scan_s)
+                if isinstance(self.planner, GPNavigationPlanner) and pose is not None:
+                    self.planner.update_point_cloud(xyz, pose[:3], scan_s)
                 origin = self.ground_mapper.origin
                 self.latest_ground_obstacles = LocalGridMap(
                     self.ground_mapper.classes.copy(), origin[0], origin[1], 0.25
@@ -640,7 +666,7 @@ class GazeboAutonomy:
 
     def run(self) -> None:
         print(
-            f"Meridian Drive MPPI is following {self.route_name} with {self.assistance.mode}. "
+            f"{self.planner_kind} is following {self.route_name} with {self.assistance.mode}. "
             f"UAV requests: {self.assistance.request_path}",
             flush=True,
         )
@@ -888,6 +914,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--waypoint", nargs=2, type=float, action="append", metavar=("X", "Y"))
     parser.add_argument("--route-file", type=Path, help="KMZ, KML, or Meridian GPS JSON route")
+    parser.add_argument(
+        "--planner",
+        choices=("meridian_mppi", "gp_navigation"),
+        default="meridian_mppi",
+        help="local navigation baseline to run",
+    )
     parser.add_argument("--assistance", choices=MODES, default="ground_only")
     parser.add_argument("--uav-map", type=Path, default=runtime / "uav_map.npz")
     parser.add_argument("--uav-request", type=Path, default=runtime / "uav_request.json")
@@ -929,6 +961,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon", type=int, default=60)
     parser.add_argument("--target-speed", type=float, default=1.7)
     parser.add_argument("--speed-max", type=float, default=2.2)
+    parser.add_argument("--gp-resolution", type=float, default=0.25)
+    parser.add_argument("--gp-radius", type=float, default=5.0)
+    parser.add_argument("--gp-inducing-points", type=int, default=160)
+    parser.add_argument("--gp-step-len", type=float, default=0.5)
+    parser.add_argument("--gp-iterations", type=int, default=1000)
+    parser.add_argument("--gp-traversability-limit", type=float, default=0.6)
+    parser.add_argument("--gp-replan-period", type=float, default=0.5)
     # Matches the harness default; see tools/run_experiment.py.
     parser.add_argument("--arrival-radius", type=float, default=1.0)
     parser.add_argument("--arrival-progress-fraction", type=float, default=0.9)
@@ -1016,6 +1055,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("speed limits must be positive and speed-max must include target-speed")
     if args.arrival_radius <= 0.0:
         parser.error("arrival-radius must be positive")
+    if args.gp_resolution <= 0.0 or args.gp_radius <= args.gp_resolution:
+        parser.error("gp-radius must be larger than the positive gp-resolution")
+    if args.gp_inducing_points < 8 or args.gp_iterations < 1:
+        parser.error("GP inducing points must be at least 8 and iterations positive")
+    if args.gp_step_len <= 0.0 or args.gp_replan_period <= 0.0:
+        parser.error("GP step length and replan period must be positive")
+    if not 0.0 <= args.gp_traversability_limit <= 1.0:
+        parser.error("gp-traversability-limit must be between 0 and 1")
     if not 0.0 <= args.arrival_progress_fraction <= 1.0:
         parser.error("arrival-progress-fraction must be between 0 and 1")
     if not 0.0 <= args.uav_uncertainty_threshold <= 1.0:
@@ -1054,8 +1101,11 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"simulated UAV semantic masks do not exist: {args.uav_semantic_masks}")
         if not args.world_file.is_file():
             parser.error(f"simulator world does not exist: {args.world_file}")
-    if args.assistance == "always_on_uav" and args.uav_source != "ground_truth":
-        parser.error("always_on_uav requires --uav-source ground_truth")
+    if args.assistance in ("explore_then_drive", "always_on_uav") \
+            and args.uav_source != "ground_truth":
+        parser.error(
+            "explore_then_drive and always_on_uav require --uav-source ground_truth"
+        )
     return args
 
 

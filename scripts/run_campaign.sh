@@ -49,7 +49,8 @@ Usage: scripts/run_campaign.sh [options]
   --seed S         first round's seed; round r uses S + r (default 7)
   --routes "A B"   routes from paths/from_truck (default Route-11 Route-12 Route-13)
   --directions "forward reverse"
-  --assistance MODE  ground_only, greedy_uav, counterfactual_uav, or always_on_uav
+  --assistance MODE  ground_only, greedy_uav, counterfactual_uav,
+                     explore_then_drive, or always_on_uav
   --uav-threshold X request when uncertain rollout exposure reaches X (default .20)
   --mapping-maturity X  seconds one swept cell must remain uncertain (default 1.0)
   --campaign NAME  run-id prefix and summary filter (default a timestamp)
@@ -108,10 +109,10 @@ if ((CPUS_PER_TRIAL > 0)); then
   fi
 fi
 case "${ASSISTANCE}" in
-  ground_only|greedy_uav|counterfactual_uav|always_on_uav) ;;
+  ground_only|greedy_uav|counterfactual_uav|explore_then_drive|always_on_uav) ;;
   *)
     echo "--assistance must be ground_only, greedy_uav, counterfactual_uav," \
-         "or always_on_uav" >&2
+         "explore_then_drive, or always_on_uav" >&2
     exit 2
     ;;
 esac
