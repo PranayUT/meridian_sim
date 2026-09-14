@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import signal
 import threading
@@ -21,7 +22,7 @@ from gz.msgs10.boolean_pb2 import Boolean
 from gz.transport13 import Node
 
 from .assistance import MODES, AssistanceManager
-from .core import MPPI, MppiConfig, Route
+from .core import MPPI, MppiConfig, Route, rollout
 from .ground_mapping import GroundMapper, SemanticMapper, write_snapshot
 from .maps import AssistanceEvaluation, LocalGridMap, MapStack, TerrainMap
 from .routes import find_default_route, load_route
@@ -60,6 +61,12 @@ class GazeboAutonomy:
         self.ground_mapper = GroundMapper()
         self.semantic_mapper = SemanticMapper()
         self.ground_map_path = args.ground_map
+        self.assistance_trace_path = args.assistance_trace
+        self.assistance_trace_path.parent.mkdir(parents=True, exist_ok=True)
+        self.assistance_trace_path.unlink(missing_ok=True)
+        self.last_assistance_trace_s = -math.inf
+        self.assistance_probe_m = float(args.assistance_probe_m)
+        self.last_trace_pose: tuple[float, float, float] | None = None
         self.last_map_write_s = 0.0
         self.latest_ground_obstacles: LocalGridMap | None = None
         self.latest_ground_obstacle_probability: LocalGridMap | None = None
@@ -101,6 +108,10 @@ class GazeboAutonomy:
         self.assistance_period_s = float(args.assistance_period)
         self.last_assistance_s = -math.inf
         self.last_evaluation = AssistanceEvaluation(0.0, None)
+        self.last_action_evaluation = AssistanceEvaluation(0.0, None)
+        self.path_uncertainty_threshold = float(
+            args.uav_path_uncertainty_threshold
+        )
         self.arrival_radius = args.arrival_radius
         self.lock = threading.Lock()
         self.mapping_lock = threading.Lock()
@@ -371,8 +382,20 @@ class GazeboAutonomy:
                 self.assistance.uncertainty_threshold,
                 now_s,
             )
+            self.last_action_evaluation = (
+                self.map_stack.evaluate_action_assistance(
+                    self.planner.best_trajectory(),
+                    self.path_uncertainty_threshold,
+                    now_s,
+                )
+            )
             self.last_assistance_s = now_s
-        evaluation = self.last_evaluation
+        action_evaluation = self.last_action_evaluation
+        evaluation = (
+            action_evaluation
+            if action_evaluation.action_relevant
+            else self.last_evaluation
+        )
         # Odometry is driven by wheel rotation and remains high when the rover
         # spins its wheels against vegetation. Detect loss of mobility from
         # world displacement, which is also what the intervention harness
@@ -386,14 +409,33 @@ class GazeboAutonomy:
             self.mobility_anchor_s = now_s
             self.mobility_anchor_xy = (x, y)
         mobility_stalled = now_s - self.mobility_anchor_s >= 5.0
+        # A stall is uncertainty-relevant only when the selected path itself
+        # still contains unresolved evidence. Do not attach a stall to an ROI
+        # drawn from unrelated rejected rollouts.
+        mobility_uncertain = mobility_stalled and action_evaluation.roi is not None
+        if mobility_uncertain and not evaluation.action_relevant:
+            evaluation = action_evaluation
+        if now_s - self.last_assistance_trace_s >= 0.5:
+            self._write_assistance_trace(
+                now_s,
+                (x, y, yaw),
+                speed,
+                float(command[0]),
+                planned,
+                mobility_stalled,
+                action_evaluation,
+            )
         self.assistance.update(
             evaluation.uncertainty_exposure,
             evaluation.roi,
             source=evaluation.source,
             map_type=evaluation.map_type,
             decision_relevant=evaluation.decision_relevant,
+            action_relevant=evaluation.action_relevant,
             speed_mps=speed,
-            mobility_stalled=mobility_stalled,
+            mobility_stalled=mobility_uncertain,
+            sim_time_s=now_s,
+            position_xy=(x, y),
         )
         if self.assistance.hold:
             command[:] = 0.0
@@ -577,6 +619,113 @@ class GazeboAutonomy:
             self._zero()
 
 
+    def _forward_probe(self, state: np.ndarray) -> np.ndarray | None:
+        """Roll the intended steering out over a fixed forward distance.
+
+        The selected MPPI trajectory is a fixed *time* horizon, so its reach
+        collapses from about 5 m to well under 1 m exactly when the controller
+        slows in front of something. A diagnostic that is meant to warn before
+        contact has to hold its warning distance constant, so this replays the
+        nominal steering at target speed for as many steps as the requested
+        distance needs.
+        """
+        if self.assistance_probe_m <= 0.0:
+            return None
+        config = self.planner.config
+        nominal = self.planner.nominal
+        step_m = max(1e-6, config.target_speed * config.dt)
+        steps = int(math.ceil(self.assistance_probe_m / step_m))
+        steer = np.asarray(nominal[:, 1], dtype=np.float64)
+        if steer.size == 0:
+            return None
+        if steps > steer.size:
+            steer = np.concatenate(
+                [steer, np.full(steps - steer.size, steer[-1])]
+            )
+        controls = np.empty((1, steps, 2), dtype=np.float64)
+        controls[0, :, 0] = config.target_speed
+        controls[0, :, 1] = steer[:steps]
+        initial = state.copy()
+        initial[3] = config.target_speed
+        return rollout(initial[None, :], controls, self.planner.model, config.dt)[
+            :, 1:
+        ]
+
+    def _write_assistance_trace(
+        self,
+        now_s: float,
+        pose: tuple[float, float, float],
+        wheel_speed: float,
+        command_speed: float,
+        population: np.ndarray | None,
+        mobility_stalled: bool,
+        action_evaluation: AssistanceEvaluation,
+    ) -> None:
+        """Record every candidate stuck-predictor at a fixed cadence.
+
+        Written in every assistance mode, including ground_only, so a control
+        run measures the same variables without a UAV map perturbing the route.
+        """
+        x, y, yaw = pose
+        # World speed, unlike wheel odometry, goes to zero when the rover is
+        # spinning its wheels against vegetation. The gap between them is the
+        # slip that precedes a wedge.
+        world_speed = None
+        if self.last_trace_pose is not None:
+            previous_x, previous_y, previous_s = self.last_trace_pose
+            elapsed = now_s - previous_s
+            if elapsed > 0.0:
+                world_speed = math.dist((x, y), (previous_x, previous_y)) / elapsed
+        self.last_trace_pose = (x, y, now_s)
+        selected = self.planner.best_trajectory()
+        state = np.asarray(
+            (x, y, yaw, wheel_speed, self.steer_state), dtype=np.float64
+        )
+        probe = self._forward_probe(state)
+        trace: dict[str, object] = {
+            "sim_time_s": now_s,
+            "vehicle_xy": [x, y],
+            "yaw_rad": yaw,
+            "wheel_speed_mps": wheel_speed,
+            "world_speed_mps": world_speed,
+            "command_speed_mps": command_speed,
+            "slip_mps": None
+            if world_speed is None
+            else max(0.0, abs(wheel_speed) - world_speed),
+            "mobility_window_s": now_s - self.mobility_anchor_s,
+            "mobility_stalled": bool(mobility_stalled),
+            "population_source": self.last_evaluation.source,
+            "population_exposure": self.last_evaluation.uncertainty_exposure,
+            "population_decision_relevant": bool(
+                self.last_evaluation.decision_relevant
+            ),
+            "action_source": action_evaluation.source,
+            "action_exposure": action_evaluation.uncertainty_exposure,
+            "action_relevant": bool(action_evaluation.action_relevant),
+            "action_roi": list(action_evaluation.roi)
+            if action_evaluation.roi is not None
+            else None,
+            "assistance_state": self.assistance.state,
+            "retained_uav_products": len(self.map_stack.aerial_history),
+            "planner_best_cost": None
+            if self.planner.last_costs is None
+            else float(np.min(self.planner.last_costs)),
+            "planner_cost_spread": None
+            if self.planner.last_costs is None
+            else float(
+                np.mean(self.planner.last_costs) - np.min(self.planner.last_costs)
+            ),
+        }
+        trace.update(
+            self.map_stack.uncertainty_diagnostics(
+                population, selected, probe, (x, y), now_s
+            )
+        )
+        with self.assistance_trace_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(trace, separators=(",", ":")) + "\n")
+        self.last_assistance_trace_s = now_s
+
+
 def parse_args() -> argparse.Namespace:
     project_root = Path(__file__).resolve().parents[2]
     runtime = project_root / "runtime"
@@ -591,6 +740,12 @@ def parse_args() -> argparse.Namespace:
         help="generate exact simulator maps or wait for an external NPZ producer",
     )
     parser.add_argument("--uav-uncertainty-threshold", type=float, default=0.20)
+    parser.add_argument(
+        "--uav-path-uncertainty-threshold",
+        type=float,
+        default=0.20,
+        help="selected-trajectory uncertainty fraction that requests UAV evidence",
+    )
     parser.add_argument(
         "--mapping-uncertainty-maturity", type=float, default=1.0,
         help="seconds one unresolved swept cell must persist before exposure",
@@ -628,6 +783,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--semantic-topic", default="/model/hill_rover/semantic/labels_map")
     parser.add_argument("--depth-topic", default="/model/hill_rover/depth")
     parser.add_argument("--ground-map", type=Path, default=runtime / "ground_maps.npz")
+    parser.add_argument(
+        "--assistance-trace",
+        type=Path,
+        default=runtime / "assistance_trace.jsonl",
+    )
+    parser.add_argument(
+        "--assistance-probe-m",
+        type=float,
+        default=8.0,
+        help="fixed forward distance measured by the trace corridor probe",
+    )
     parser.add_argument("--command-topic", default="/model/hill_rover/cmd_vel")
     parser.add_argument(
         "--terrain-dem",
@@ -657,6 +823,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("speed limits must be positive and speed-max must include target-speed")
     if not 0.0 <= args.uav_uncertainty_threshold <= 1.0:
         parser.error("uav-uncertainty-threshold must be between 0 and 1")
+    if not 0.0 <= args.uav_path_uncertainty_threshold <= 1.0:
+        parser.error("uav-path-uncertainty-threshold must be between 0 and 1")
     if args.assistance_period < 0.0:
         parser.error("assistance-period may not be negative")
     if args.mapping_uncertainty_maturity < 0.0:

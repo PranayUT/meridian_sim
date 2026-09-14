@@ -299,6 +299,7 @@ def run_trial(
         "--assistance", args.assistance,
         "--uav-source", args.uav_source,
         "--uav-uncertainty-threshold", str(args.uav_uncertainty_threshold),
+        "--uav-path-uncertainty-threshold", str(args.uav_path_uncertainty_threshold),
         "--mapping-uncertainty-maturity", str(args.mapping_uncertainty_maturity),
         "--assistance-period", str(args.assistance_period),
         "--uav-map-size", str(args.uav_map_size),
@@ -306,6 +307,8 @@ def run_trial(
         "--seed", str(trial.seed),
         "--arrival-radius", str(args.arrival_radius),
         "--ground-map", str(args.run_dir / "ground_maps.npz"),
+        "--assistance-trace", str(args.run_dir / "assistance_trace.jsonl"),
+        "--assistance-probe-m", str(args.assistance_probe_m),
         "--status", str(args.run_dir / "autonomy_status.json"),
         "--uav-request", str(args.run_dir / "uav_request.json"),
         "--no-visualization",
@@ -318,6 +321,8 @@ def run_trial(
     goal = anchors[-1]
     wall_start = time.monotonic()
     interventions = 0
+    intervention_history: list[dict[str, object]] = []
+    intervention_history_path = args.run_dir / "intervention_history.json"
     resolved = 0
     pending_drag = False
     outcome = "timeout"
@@ -380,6 +385,29 @@ def run_trial(
                     interventions += 1
                     route_progress_m = max(route_progress_m, drag_progress)
                     pending_drag = True
+                    intervention_history.append(
+                        {
+                            "intervention_number": interventions,
+                            "trial_time_s": sim_s - sim_start,
+                            "sim_time_s": sim_s,
+                            "stuck_xy": [xy[0], xy[1]],
+                            "target_xy": [drag_x, drag_y],
+                            "route_progress_m": route_progress_m,
+                            "path_length_m": path_m,
+                        }
+                    )
+                    temporary_history = intervention_history_path.with_name(
+                        f".{intervention_history_path.name}.{os.getpid()}.tmp"
+                    )
+                    temporary_history.write_text(
+                        json.dumps(
+                            {"version": 1, "interventions": intervention_history},
+                            indent=2,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    temporary_history.replace(intervention_history_path)
                     print(
                         f"    drag {interventions}: to ({drag_x:.1f}, {drag_y:.1f}) "
                         f"at sim {sim_s:.0f}s",
@@ -444,6 +472,9 @@ def main() -> int:
     )
     parser.add_argument("--uav-source", choices=("ground_truth", "file"), default="ground_truth")
     parser.add_argument("--uav-uncertainty-threshold", type=float, default=0.20)
+    parser.add_argument("--uav-path-uncertainty-threshold", type=float, default=0.20)
+    parser.add_argument("--assistance-probe-m", type=float, default=8.0,
+                        help="forward distance measured by the trace corridor probe")
     parser.add_argument("--mapping-uncertainty-maturity", type=float, default=1.0)
     parser.add_argument("--assistance-period", type=float, default=0.0,
                         help="seconds between assistance evaluations; 0 evaluates every tick")
@@ -483,6 +514,8 @@ def main() -> int:
         parser.error("min-route-progress must be between 0 and 1")
     if not 0.0 <= args.uav_uncertainty_threshold <= 1.0:
         parser.error("uav-uncertainty-threshold must be between 0 and 1")
+    if not 0.0 <= args.uav_path_uncertainty_threshold <= 1.0:
+        parser.error("uav-path-uncertainty-threshold must be between 0 and 1")
     if args.mapping_uncertainty_maturity < 0.0:
         parser.error("mapping-uncertainty-maturity must be non-negative")
 

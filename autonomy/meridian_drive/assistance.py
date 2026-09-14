@@ -55,6 +55,11 @@ class AssistanceManager:
         self._request_history_path = self.request_path.with_name(
             f"{self.request_path.stem}_history.json"
         )
+        self._trigger_history: list[dict[str, object]] = []
+        self._trigger_history_path = self.request_path.with_name(
+            f"{self.request_path.stem}_trigger_history.json"
+        )
+        self._trigger_key: tuple[object, ...] | None = None
         self._region_counts: dict[tuple[str, str, int, int], int] = {}
         self._region_key: tuple[str, str, int, int] | None = None
         self._last_request_s = 0.0
@@ -67,8 +72,12 @@ class AssistanceManager:
         self._pending_map_type = ""
         self._pending_exposure = 0.0
         self._pending_decision_relevant = False
+        self._pending_action_relevant = False
         self._pending_mobility_relevant = False
+        self._pending_sim_time_s: float | None = None
+        self._pending_position_xy: tuple[float, float] | None = None
         self._mobility_relevant = False
+        self._action_relevant = False
         self._mobility_episode_served = False
         # Meridian Drive excludes aerial evidence older than the active trial.
         # Remember any pre-existing file so only a later atomic replacement is
@@ -119,8 +128,11 @@ class AssistanceManager:
         source: str = "",
         map_type: str = "",
         decision_relevant: bool = False,
+        action_relevant: bool = False,
         speed_mps: float = 0.0,
         mobility_stalled: bool = False,
+        sim_time_s: float | None = None,
+        position_xy: tuple[float, float] | None = None,
     ) -> None:
         if self.reload_map():
             # The exposure came from the prior map. Let the next planner cycle
@@ -149,7 +161,10 @@ class AssistanceManager:
                         source=self._pending_source,
                         map_type=self._pending_map_type,
                         decision_relevant=self._pending_decision_relevant,
+                        action_relevant=self._pending_action_relevant,
                         mobility_relevant=self._pending_mobility_relevant,
+                        sim_time_s=self._pending_sim_time_s,
+                        position_xy=self._pending_position_xy,
                     )
                     self.state = "waiting"
             else:
@@ -173,9 +188,11 @@ class AssistanceManager:
         if not mobility_stalled:
             self._mobility_episode_served = False
         self._mobility_relevant = mobility_relevant
+        self._action_relevant = action_relevant
         should_request = (
             (
                 decision_relevant
+                or action_relevant
                 or mobility_relevant
                 or exposure >= self.uncertainty_threshold
             )
@@ -193,6 +210,35 @@ class AssistanceManager:
         else:
             self._high_since.pop(source, None)
         persistent = should_request and now - self._high_since[source] >= self.persistence_s
+        trigger_kind = (
+            "mobility"
+            if mobility_relevant
+            else (
+                "selected_trajectory"
+                if action_relevant
+                else ("counterfactual" if decision_relevant else "exposure")
+            )
+        )
+        if persistent:
+            assert roi is not None
+            # One continuous condition is one trigger episode. ROI cell noise
+            # must not turn it into a stream of nominally different events.
+            trigger_key = (trigger_kind, source, map_type)
+            if trigger_key != self._trigger_key:
+                self._record_trigger(
+                    roi,
+                    exposure,
+                    source,
+                    map_type,
+                    trigger_kind,
+                    sim_time_s,
+                    position_xy,
+                )
+                self._trigger_key = trigger_key
+                if mobility_relevant:
+                    self._mobility_episode_served = True
+        elif not should_request:
+            self._trigger_key = None
         if self.state == "exhausted" and not should_request:
             self.state = "driving"
             self._region_key = None
@@ -209,7 +255,10 @@ class AssistanceManager:
                     source=source,
                     map_type=map_type,
                     decision_relevant=decision_relevant,
+                    action_relevant=action_relevant,
                     mobility_relevant=mobility_relevant,
+                    sim_time_s=sim_time_s,
+                    position_xy=position_xy,
                 )
         elif persistent:
             assert roi is not None
@@ -230,14 +279,21 @@ class AssistanceManager:
                     self._pending_map_type = map_type
                     self._pending_exposure = exposure
                     self._pending_decision_relevant = decision_relevant
+                    self._pending_action_relevant = action_relevant
                     self._pending_mobility_relevant = mobility_relevant
+                    self._pending_sim_time_s = sim_time_s
+                    self._pending_position_xy = position_xy
                     if mobility_relevant:
                         self._mobility_episode_served = True
                     self._stopped_since = None
                     reason = (
                         "commanded motion stalled in an uncertain ROI"
                         if mobility_relevant
-                        else "uncertainty crossed the rollout threshold"
+                        else (
+                            "selected trajectory crossed uncertain evidence"
+                            if action_relevant
+                            else "uncertainty crossed the rollout threshold"
+                        )
                     )
                     self.detail = f"{reason}; stopping to ask for help"
         if now - self._last_status_s >= 0.5:
@@ -252,7 +308,10 @@ class AssistanceManager:
         source: str,
         map_type: str,
         decision_relevant: bool = False,
+        action_relevant: bool = False,
         mobility_relevant: bool = False,
+        sim_time_s: float | None = None,
+        position_xy: tuple[float, float] | None = None,
     ) -> None:
         roi = self._fixed_roi(roi)
         self._request_id = uuid.uuid4().hex
@@ -269,7 +328,10 @@ class AssistanceManager:
             "roi_xy": [[x0, y1], [x1, y1], [x1, y0], [x0, y0]],
             "uncertainty_exposure": exposure,
             "decision_relevant": decision_relevant,
+            "action_relevant": action_relevant,
             "mobility_relevant": mobility_relevant,
+            "sim_time_s": sim_time_s,
+            "vehicle_xy": list(position_xy) if position_xy is not None else None,
             "hold_requested": hold,
             "result_path": str(self.map_path),
             "created_unix_s": time.time(),
@@ -296,6 +358,35 @@ class AssistanceManager:
         action = "Holding for" if hold else "Requested"
         self.detail = f"{action} UAV map {self._request_id}"
 
+    def _record_trigger(
+        self,
+        roi: tuple[float, float, float, float],
+        exposure: float,
+        source: str,
+        map_type: str,
+        trigger_kind: str,
+        sim_time_s: float | None,
+        position_xy: tuple[float, float] | None,
+    ) -> None:
+        fixed_roi = self._fixed_roi(roi)
+        x0, y0, x1, y1 = fixed_roi
+        payload: dict[str, object] = {
+            "trigger_number": len(self._trigger_history) + 1,
+            "trigger_kind": trigger_kind,
+            "source": source,
+            "map_type": map_type,
+            "uncertainty_exposure": exposure,
+            "sim_time_s": sim_time_s,
+            "vehicle_xy": list(position_xy) if position_xy is not None else None,
+            "roi_xy": [[x0, y1], [x1, y1], [x1, y0], [x0, y0]],
+            "created_unix_s": time.time(),
+        }
+        self._trigger_history.append(payload)
+        self._atomic_json(
+            self._trigger_history_path,
+            {"version": 1, "triggers": self._trigger_history},
+        )
+
     def _write_status(self, exposure: float) -> None:
         aerial = self.map_stack.aerial
         payload = {
@@ -308,6 +399,7 @@ class AssistanceManager:
             "uncertainty_threshold": self.uncertainty_threshold,
             "map_size_m": self.map_size_m,
             "uncertainty_exposure": exposure,
+            "action_relevant": self._action_relevant,
             "mobility_relevant": self._mobility_relevant,
             "map_loaded": aerial is not None,
             "map_sequence": aerial.sequence if aerial is not None else None,

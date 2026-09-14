@@ -143,6 +143,63 @@ class UavMap:
         valid = covered & np.isfinite(cost) & np.isfinite(obstacle) & np.isfinite(uncertainty)
         return cost, obstacle, uncertainty, valid
 
+    @property
+    def bounds(self) -> tuple[float, float, float, float]:
+        """World extent covered by this product, as (x0, y0, x1, y1)."""
+        return (
+            self.origin_x,
+            self.origin_y,
+            self.origin_x + self.shape[1] * self.resolution,
+            self.origin_y + self.shape[0] * self.resolution,
+        )
+
+    def covers_any(self, x: np.ndarray, y: np.ndarray) -> bool:
+        """Cheap rejection test before rasterising a 25 m window.
+
+        Retained products accumulate along the route, and most of them are
+        nowhere near the current rollout population. Comparing two bounding
+        boxes costs four floats; sampling the raster costs a full index pass
+        per query point.
+        """
+        x0, y0, x1, y1 = self.bounds
+        return bool(
+            np.any((x >= x0) & (x < x1) & (y >= y0) & (y < y1))
+        )
+
+    def sample_all(
+        self, x: np.ndarray, y: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Sample every layer, planner-facing and uncertainty, in one pass."""
+        col = np.floor((x - self.origin_x) / self.resolution).astype(np.int64)
+        row = np.floor((y - self.origin_y) / self.resolution).astype(np.int64)
+        covered = (
+            (row >= 0)
+            & (row < self.shape[0])
+            & (col >= 0)
+            & (col < self.shape[1])
+        )
+        safe_row = np.clip(row, 0, self.shape[0] - 1)
+        safe_col = np.clip(col, 0, self.shape[1] - 1)
+        cost = np.where(covered, self.cost_grid[safe_row, safe_col], 0.0)
+        obstacle = np.where(covered, self.obstacle_grid[safe_row, safe_col], 0.0)
+        clearance = np.where(
+            covered, self.obstacle_clearance_grid[safe_row, safe_col], 0.0
+        )
+        uncertainty = np.where(
+            covered, self.uncertainty_grid[safe_row, safe_col], 1.0
+        )
+        # Coverage is decided by the planner layers alone, as it was when the
+        # uncertainty layer came from a second sample() call. A non-finite
+        # uncertainty inside a covered cell stays non-finite here rather than
+        # silently changing which cells the aerial product speaks for.
+        valid = (
+            covered
+            & np.isfinite(cost)
+            & np.isfinite(obstacle)
+            & np.isfinite(clearance)
+        )
+        return cost, obstacle, clearance, uncertainty, valid
+
     def sample_planner(
         self, x: np.ndarray, y: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -182,6 +239,28 @@ class AssistanceEvaluation:
     source: str = ""
     map_type: str = ""
     decision_relevant: bool = False
+    action_relevant: bool = False
+
+
+@dataclass(frozen=True)
+class CounterfactualViability:
+    """Meridian's free/occupied hypothesis test, reported rather than reduced."""
+
+    baseline: float
+    free: float
+    occupied: float
+    useful_fraction: float
+    decision_relevant: bool
+
+
+def _arc_length(states: np.ndarray) -> float:
+    """Mean path length of a set of rollouts, in metres."""
+    if states.shape[-2] < 2:
+        return 0.0
+    steps = np.hypot(
+        np.diff(states[..., 0], axis=-1), np.diff(states[..., 1], axis=-1)
+    )
+    return float(np.mean(np.sum(steps, axis=-1)))
 
 
 def _scalar(archive: object, key: str) -> object:
@@ -375,6 +454,9 @@ class MapStack:
         default_factory=dict, init=False, repr=False
     )
 
+    # Rollouts kept when subsampling the population for diagnostics.
+    _DIAGNOSTIC_ROLLOUTS = 24
+
     _FOOTPRINT_OFFSETS = (
         (0.0, 0.0),
         (-0.225, 0.0),
@@ -413,20 +495,32 @@ class MapStack:
         clearance = np.zeros_like(x, dtype=np.float64)
         uncertainty = np.ones_like(x, dtype=np.float64)
         valid = np.zeros_like(x, dtype=bool)
-        # Newest product wins where fixed 25 m requests overlap.
+        # Newest product wins where fixed 25 m requests overlap. Retained
+        # products are cheap to hold but were not cheap to consult: every one
+        # of them rasterised the full query on every planner call, so the
+        # per-tick cost grew linearly with how much of the route had been
+        # answered. Reject by extent first, and stop once every query point
+        # has an answer.
         for product in reversed(self._aerial_products()):
             if not product.provides(map_type):
                 continue
-            p_cost, p_obstacle, p_clearance, p_valid = product.sample_planner(
-                x, y
-            )
-            _, _, p_uncertainty, _ = product.sample(x, y)
+            if not product.covers_any(x, y):
+                continue
+            (
+                p_cost,
+                p_obstacle,
+                p_clearance,
+                p_uncertainty,
+                p_valid,
+            ) = product.sample_all(x, y)
             selected = p_valid & ~valid
             cost = np.where(selected, p_cost, cost)
             obstacle = np.where(selected, p_obstacle, obstacle)
             clearance = np.where(selected, p_clearance, clearance)
             uncertainty = np.where(selected, p_uncertainty, uncertainty)
             valid |= p_valid
+            if valid.all():
+                break
         return cost, obstacle, clearance, uncertainty, valid
 
     def cost(self, x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -506,13 +600,14 @@ class MapStack:
                     total_cost, np.where(known, 4.0 * probability, 0.0)
                 )
             if self._aerial_products():
+                # Semantic traversability describes what the canopy looks
+                # like from above; it is not a second physical-body raster.
+                # Treating its full bush/tree extent as hard collision made a
+                # semantic answer much more restrictive than Gazebo geometry.
+                # Only occupancy supplies physical collision and clearance.
                 aerial_cost = np.maximum(occupancy_cost, semantic_cost)
-                aerial_obstacle = np.maximum(
-                    occupancy_obstacle, semantic_obstacle
-                )
-                aerial_clearance = np.maximum(
-                    occupancy_clearance, semantic_clearance
-                )
+                aerial_obstacle = occupancy_obstacle
+                aerial_clearance = occupancy_clearance
                 aerial_valid = occupancy_valid | semantic_valid
                 total_cost = np.maximum(
                     total_cost,
@@ -596,6 +691,268 @@ class MapStack:
         # failed. Discarding it here made the UAV blind for the full 30 s until
         # the experiment harness dragged a physically wedged rover.
         return highest
+
+    def evaluate_action_assistance(
+        self,
+        trajectory: np.ndarray | None,
+        exposure_threshold: float = 0.20,
+        now_s: float | None = None,
+    ) -> AssistanceEvaluation:
+        """Evaluate uncertainty on the trajectory the controller selected.
+
+        The population policy answers whether uncertainty changes the choice
+        among sampled controls. This complementary gate answers whether the
+        control that will actually be executed crosses unresolved evidence.
+        Source-level persistence is applied by AssistanceManager. Per-cell
+        maturity is intentionally not applied here: a moving three-second
+        action horizon continually acquires new cells, and requiring those
+        future cells to remain in the horizon would suppress the warning until
+        after the rover stopped.
+        """
+        if trajectory is None or len(trajectory) == 0:
+            return AssistanceEvaluation(0.0, None)
+        trajectories = np.asarray(trajectory)
+        if trajectories.ndim == 2:
+            trajectories = trajectories[None, ...]
+        candidates: list[AssistanceEvaluation] = []
+        occupancy = self._evidence_exposure(
+            trajectories,
+            self.ground_occupancy_uncertainty,
+            source="lidar_occupancy",
+            map_type=OCCUPANCY_MAP_TYPE,
+            uncertainty_min=0.04,
+            probability_layer=self.ground_obstacle_probability,
+            now_s=None,
+        )
+        if occupancy is not None:
+            candidates.append(occupancy)
+        semantic = self._evidence_exposure(
+            trajectories,
+            self.ground_semantic_uncertainty,
+            source="ground_semantic_cost",
+            map_type=SEMANTIC_MAP_TYPE,
+            uncertainty_min=0.04,
+            now_s=None,
+        )
+        if semantic is not None:
+            candidates.append(semantic)
+        if not candidates:
+            return AssistanceEvaluation(0.0, None)
+        selected = next(
+            (
+                item
+                for item in candidates
+                if item.roi is not None
+                and item.uncertainty_exposure >= exposure_threshold
+            ),
+            None,
+        )
+        if selected is not None:
+            return AssistanceEvaluation(
+                selected.uncertainty_exposure,
+                selected.roi,
+                selected.source,
+                selected.map_type,
+                action_relevant=True,
+            )
+        return max(candidates, key=lambda item: item.uncertainty_exposure)
+
+    def uncertainty_diagnostics(
+        self,
+        population: np.ndarray | None,
+        selected: np.ndarray | None,
+        probe: np.ndarray | None,
+        initial_xy: tuple[float, float] | None,
+        now_s: float | None = None,
+    ) -> dict[str, float | None]:
+        """Measure every candidate stuck-predictor over one planner cycle.
+
+        This is instrumentation, not policy. Nothing here feeds a request; the
+        purpose is to record many uncertainty, hazard, and geometry variables
+        at a fixed cadence so that drag events can be correlated against all of
+        them offline instead of one hypothesis at a time.
+
+        Three geometries are measured wherever a variable supports it:
+
+        - ``population``: every sampled rollout, which is what the Meridian
+          exposure policy consumes;
+        - ``selected``: the trajectory the controller actually chose, whose
+          extent shrinks with commanded speed;
+        - ``probe``: a fixed-distance forward corridor, which keeps a constant
+          warning distance even when the vehicle has slowed to a crawl.
+        """
+        # The rollout population is 192 x 60 states before the nine footprint
+        # offsets. Measuring all of it twice a second cost more than the whole
+        # 50 ms control tick once retained aerial products were in play, and a
+        # starved controller changes the very behaviour being measured. A
+        # strided subsample answers the same distributional questions.
+        sampled = None
+        if population is not None and len(population):
+            population = np.asarray(population)
+            stride = max(1, len(population) // self._DIAGNOSTIC_ROLLOUTS)
+            sampled = population[::stride]
+        out: dict[str, float | None] = {}
+        for label, states, fused in (
+            ("pop", sampled, False),
+            ("path", selected, True),
+            ("probe", probe, True),
+        ):
+            out.update(self._geometry_diagnostics(label, states, fused))
+        if sampled is not None and initial_xy is not None:
+            viability = self._counterfactual_viability(
+                sampled, initial_xy, "lidar_occupancy", now_s
+            )
+            if viability is not None:
+                out["cf_baseline_viability"] = viability.baseline
+                out["cf_free_viability"] = viability.free
+                out["cf_occupied_viability"] = viability.occupied
+                out["cf_useful_fraction"] = viability.useful_fraction
+                out["cf_decision_relevant"] = float(viability.decision_relevant)
+        if initial_xy is not None:
+            out.update(self._footprint_diagnostics(initial_xy))
+        return out
+
+    def _geometry_diagnostics(
+        self, label: str, states: np.ndarray | None, fused: bool = True
+    ) -> dict[str, float | None]:
+        """Uncertainty, hazard, and extent measured over one set of states."""
+        keys = (
+            "occ_exposure",
+            "occ_unknown_frac",
+            "occ_ambiguous_frac",
+            "occ_variance_frac",
+            "occ_probability_max",
+            "occ_probability_mean",
+            "occ_blocked_frac",
+            "sem_exposure",
+            "sem_unknown_frac",
+            "sem_cost_max",
+            "sem_cost_mean",
+            "sem_blocked_frac",
+            "fused_cost_max",
+            "fused_cost_mean",
+            "fused_blocked_frac",
+            "extent_m",
+        )
+        out: dict[str, float | None] = {f"{label}_{key}": None for key in keys}
+        if states is None or len(states) == 0:
+            return out
+        states = np.asarray(states)
+        if states.ndim == 2:
+            states = states[None, ...]
+        x, y = self._swept_points(states)
+        x = x.reshape(-1)
+        y = y.reshape(-1)
+        out[f"{label}_extent_m"] = _arc_length(states)
+
+        variance_layer = self.ground_occupancy_uncertainty
+        probability_layer = self.ground_obstacle_probability
+        if variance_layer is not None or probability_layer is not None:
+            unknown = np.ones(x.shape, dtype=bool)
+            ambiguous = np.zeros(x.shape, dtype=bool)
+            high_variance = np.zeros(x.shape, dtype=bool)
+            probability = np.full(x.shape, np.nan)
+            if variance_layer is not None:
+                variance, valid = variance_layer.sample(x, y)
+                known = valid & np.isfinite(variance)
+                high_variance = known & (variance >= 0.04)
+                unknown &= ~known
+            if probability_layer is not None:
+                sampled, valid = probability_layer.sample(x, y)
+                known = valid & np.isfinite(sampled)
+                probability = np.where(known, sampled, np.nan)
+                ambiguous = known & (sampled >= 0.20) & (sampled <= 0.80)
+                unknown &= ~known
+            out[f"{label}_occ_unknown_frac"] = float(np.mean(unknown))
+            out[f"{label}_occ_ambiguous_frac"] = float(np.mean(ambiguous))
+            out[f"{label}_occ_variance_frac"] = float(np.mean(high_variance))
+            out[f"{label}_occ_exposure"] = float(
+                np.mean(unknown | ambiguous | high_variance)
+            )
+            if np.any(np.isfinite(probability)):
+                out[f"{label}_occ_probability_max"] = float(
+                    np.nanmax(probability)
+                )
+                out[f"{label}_occ_probability_mean"] = float(
+                    np.nanmean(probability)
+                )
+                out[f"{label}_occ_blocked_frac"] = float(
+                    np.mean(np.nan_to_num(probability, nan=0.0) >= 0.50)
+                )
+
+        semantic_layer = self.ground_semantics
+        if semantic_layer is not None:
+            cost, valid = semantic_layer.sample(x, y)
+            known = valid & np.isfinite(cost)
+            out[f"{label}_sem_unknown_frac"] = float(np.mean(~known))
+            if np.any(known):
+                out[f"{label}_sem_cost_max"] = float(np.max(cost[known]))
+                out[f"{label}_sem_cost_mean"] = float(np.mean(cost[known]))
+        semantic_variance = self.ground_semantic_uncertainty
+        if semantic_variance is not None:
+            variance, valid = semantic_variance.sample(x, y)
+            known = valid & np.isfinite(variance)
+            out[f"{label}_sem_exposure"] = float(
+                np.mean((~known) | (known & (variance >= 0.04)))
+            )
+        semantic_obstacles = self.ground_semantic_obstacles
+        if semantic_obstacles is not None:
+            obstacle, valid = semantic_obstacles.sample(x, y)
+            known = valid & np.isfinite(obstacle)
+            out[f"{label}_sem_blocked_frac"] = float(
+                np.mean(known & (obstacle >= self.semantic_collision_probability))
+            )
+
+        if fused:
+            cost, blocked = self.cost(states[..., 0], states[..., 1])
+            if cost.size:
+                out[f"{label}_fused_cost_max"] = float(np.max(cost))
+                out[f"{label}_fused_cost_mean"] = float(np.mean(cost))
+                out[f"{label}_fused_blocked_frac"] = float(np.mean(blocked))
+        return out
+
+    def _footprint_diagnostics(
+        self, initial_xy: tuple[float, float]
+    ) -> dict[str, float | None]:
+        """What the maps say about the cells the vehicle is standing on."""
+        out: dict[str, float | None] = {
+            "here_occ_probability": None,
+            "here_occ_variance": None,
+            "here_sem_cost": None,
+            "here_fused_cost": None,
+            "here_blocked": None,
+        }
+        x = np.array(
+            [initial_xy[0] + dx for dx, _ in self._FOOTPRINT_OFFSETS],
+            dtype=np.float64,
+        )
+        y = np.array(
+            [initial_xy[1] + dy for _, dy in self._FOOTPRINT_OFFSETS],
+            dtype=np.float64,
+        )
+        if self.ground_obstacle_probability is not None:
+            probability, valid = self.ground_obstacle_probability.sample(x, y)
+            known = valid & np.isfinite(probability)
+            if np.any(known):
+                out["here_occ_probability"] = float(np.max(probability[known]))
+        if self.ground_occupancy_uncertainty is not None:
+            variance, valid = self.ground_occupancy_uncertainty.sample(x, y)
+            known = valid & np.isfinite(variance)
+            if np.any(known):
+                out["here_occ_variance"] = float(np.max(variance[known]))
+        if self.ground_semantics is not None:
+            cost, valid = self.ground_semantics.sample(x, y)
+            known = valid & np.isfinite(cost)
+            if np.any(known):
+                out["here_sem_cost"] = float(np.max(cost[known]))
+        # MapStack.cost sweeps the footprint itself, so it takes the centre.
+        centre_x = np.array([initial_xy[0]], dtype=np.float64)
+        centre_y = np.array([initial_xy[1]], dtype=np.float64)
+        cost, blocked = self.cost(centre_x, centre_y)
+        if cost.size:
+            out["here_fused_cost"] = float(np.max(cost))
+            out["here_blocked"] = float(np.mean(blocked))
+        return out
 
     def _evidence_exposure(
         self,
@@ -682,6 +1039,34 @@ class MapStack:
         )
         if exposure is None or initial_xy is None or self.ground_obstacle_probability is None:
             return exposure
+        viability = self._counterfactual_viability(
+            trajectories, initial_xy, exposure.source, now_s
+        )
+        if viability is None:
+            return exposure
+        return AssistanceEvaluation(
+            exposure.uncertainty_exposure,
+            exposure.roi,
+            exposure.source,
+            exposure.map_type,
+            viability.decision_relevant,
+        )
+
+    def _counterfactual_viability(
+        self,
+        trajectories: np.ndarray,
+        initial_xy: tuple[float, float],
+        source: str,
+        now_s: float | None,
+    ) -> "CounterfactualViability | None":
+        """Meridian's free/occupied hypothesis test over a rollout population.
+
+        Shared by the live occupancy evaluation and by the offline uncertainty
+        diagnostics so the two cannot report different viabilities for the same
+        population.
+        """
+        if self.ground_obstacle_probability is None:
+            return None
         states_x = trajectories[..., 0]
         states_y = trajectories[..., 1]
         probabilities: list[np.ndarray] = []
@@ -706,7 +1091,7 @@ class MapStack:
                 probability = np.where(aerial_valid, aerial_probability, probability)
                 uncertain = np.where(aerial_valid, aerial_uncertainty >= 0.04, uncertain)
             uncertain = self._mature_sample_uncertainty(
-                exposure.source,
+                source,
                 x,
                 y,
                 uncertain,
@@ -728,17 +1113,19 @@ class MapStack:
         baseline_viability = float(np.mean(useful & (baseline_max < 0.50)))
         free_viability = float(np.mean(useful & (free_max < 0.50)))
         occupied_viability = float(np.mean(useful & (occupied_max < 0.50)))
-        decision_relevant = (
+        # bool(): `np.any(...) and ...` returns np.bool_ when it short-circuits
+        # on a False first operand, and np.bool_ is not JSON serializable.
+        decision_relevant = bool(
             np.any(uncertain)
             and baseline_viability < 0.20
             and max(free_viability, occupied_viability) - baseline_viability >= 0.15
             and abs(free_viability - occupied_viability) >= 0.15
         )
-        return AssistanceEvaluation(
-            exposure.uncertainty_exposure,
-            exposure.roi,
-            exposure.source,
-            exposure.map_type,
+        return CounterfactualViability(
+            baseline_viability,
+            free_viability,
+            occupied_viability,
+            float(np.mean(useful)),
             decision_relevant,
         )
 

@@ -19,6 +19,7 @@ from autonomy.meridian_drive.maps import (
     LocalGridMap,
     MapStack,
     TerrainMap,
+    UavMap,
     load_uav_map,
 )
 from autonomy.meridian_drive.obstacle_grid_logic import (
@@ -367,6 +368,31 @@ class MapTests(unittest.TestCase):
         self.assertIsNone(immature.roi)
         self.assertTrue(mature.decision_relevant)
         self.assertIsNotNone(mature.roi)
+
+    def test_selected_trajectory_has_independent_uncertainty_trigger(self) -> None:
+        variance = np.zeros((4, 16), dtype=np.float32)
+        variance[:, :4] = 0.25
+        stack = MapStack(
+            ground_occupancy_uncertainty=LocalGridMap(
+                variance, 0.0, 0.0, 1.0
+            ),
+            uncertainty_maturity_s=0.0,
+        )
+        selected = np.asarray(
+            [[0.5, 1.5], [1.5, 1.5], [2.5, 1.5], [3.5, 1.5]]
+        )
+        rejected = np.asarray(
+            [[10.5, 1.5], [11.5, 1.5], [12.5, 1.5], [13.5, 1.5]]
+        )
+
+        action = stack.evaluate_action_assistance(selected, 0.20)
+        unrelated_action = stack.evaluate_action_assistance(rejected, 0.20)
+
+        self.assertTrue(action.action_relevant)
+        self.assertEqual(action.source, "lidar_occupancy")
+        self.assertIsNotNone(action.roi)
+        self.assertFalse(unrelated_action.action_relevant)
+        self.assertIsNone(unrelated_action.roi)
 
     def test_meridian_ground_classes_reach_planner_cost(self) -> None:
         grid = np.asarray([[0, 50, 100]], dtype=np.int8)
@@ -725,9 +751,15 @@ class MapTests(unittest.TestCase):
             )
 
             request = json.loads((root / "request.json").read_text())
+            trigger_history = json.loads(
+                (root / "request_trigger_history.json").read_text()
+            )
             self.assertTrue(request["mobility_relevant"])
             self.assertFalse(request["decision_relevant"])
             self.assertLess(request["uncertainty_exposure"], 0.75)
+            self.assertEqual(
+                trigger_history["triggers"][0]["trigger_kind"], "mobility"
+            )
 
     def test_ground_truth_uav_writes_occupancy_and_goose_labels(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -832,7 +864,10 @@ class MapTests(unittest.TestCase):
                 path = root / f"{sequence}.npz"
                 np.savez_compressed(
                     path,
-                    cost=np.zeros((1, 1), dtype=np.float32),
+                    cost=np.asarray(
+                        [[0.8 if map_type == SEMANTIC_MAP_TYPE else 0.0]],
+                        dtype=np.float32,
+                    ),
                     obstacle=np.asarray([[obstacle]], dtype=np.float32),
                     uncertainty=np.zeros((1, 1), dtype=np.float32),
                     map_types=np.asarray((map_type,)),
@@ -849,7 +884,7 @@ class MapTests(unittest.TestCase):
         self.assertEqual(stack.aerial.sequence, 2)
         self.assertGreater(float(cost[0]), 0.0)
         self.assertGreater(float(cost[1]), 0.0)
-        self.assertEqual(collision.tolist(), [True, True])
+        self.assertEqual(collision.tolist(), [True, False])
 
     def test_ground_only_never_loads_a_stale_uav_map(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -873,6 +908,162 @@ class MapTests(unittest.TestCase):
             )
             self.assertIsNone(stack.aerial)
             self.assertFalse(manager.reload_map())
+
+
+class AerialSamplingTest(unittest.TestCase):
+    """Retained-product sampling was made cheaper; it must stay identical."""
+
+    @staticmethod
+    def _product(origin_x: float, sequence: int, map_type: str) -> UavMap:
+        rng = np.random.default_rng(sequence)
+        shape = (100, 100)
+        return UavMap(
+            rng.random(shape),
+            rng.random(shape),
+            rng.random(shape),
+            rng.random(shape),
+            origin_x,
+            0.0,
+            0.25,
+            sequence,
+            (map_type,),
+        )
+
+    def test_extent_prefilter_matches_sampling_every_product(self) -> None:
+        stack = MapStack()
+        for index in range(6):
+            stack.add_aerial(
+                self._product(
+                    index * 20.0,
+                    index,
+                    OCCUPANCY_MAP_TYPE if index % 2 else SEMANTIC_MAP_TYPE,
+                )
+            )
+        rng = np.random.default_rng(11)
+        x = rng.uniform(-10.0, 140.0, 500)
+        y = rng.uniform(-10.0, 35.0, 500)
+
+        def reference(map_type: str) -> tuple[np.ndarray, ...]:
+            """The loop as it read before the extent and early-exit shortcuts."""
+            cost = np.zeros_like(x)
+            obstacle = np.zeros_like(x)
+            clearance = np.zeros_like(x)
+            uncertainty = np.ones_like(x)
+            valid = np.zeros_like(x, dtype=bool)
+            for product in reversed(stack.aerial_history):
+                if not product.provides(map_type):
+                    continue
+                p_cost, p_obstacle, p_clearance, p_valid = product.sample_planner(x, y)
+                _, _, p_uncertainty, _ = product.sample(x, y)
+                selected = p_valid & ~valid
+                cost = np.where(selected, p_cost, cost)
+                obstacle = np.where(selected, p_obstacle, obstacle)
+                clearance = np.where(selected, p_clearance, clearance)
+                uncertainty = np.where(selected, p_uncertainty, uncertainty)
+                valid |= p_valid
+            return cost, obstacle, clearance, uncertainty, valid
+
+        for map_type in (OCCUPANCY_MAP_TYPE, SEMANTIC_MAP_TYPE):
+            with self.subTest(map_type=map_type):
+                for expected, actual in zip(
+                    reference(map_type), stack._sample_aerial(x, y, map_type)
+                ):
+                    np.testing.assert_array_equal(expected, actual)
+
+    def test_a_product_elsewhere_on_the_route_is_not_consulted(self) -> None:
+        stack = MapStack()
+        stack.add_aerial(self._product(500.0, 0, OCCUPANCY_MAP_TYPE))
+        x = np.linspace(0.0, 10.0, 50)
+        y = np.zeros_like(x)
+        self.assertFalse(stack.aerial_history[0].covers_any(x, y))
+        *_, valid = stack._sample_aerial(x, y, OCCUPANCY_MAP_TYPE)
+        self.assertFalse(bool(valid.any()))
+
+
+class UncertaintyDiagnosticsTest(unittest.TestCase):
+    """The stuck-correlation instrumentation is measured, so it must be sane."""
+
+    @staticmethod
+    def _stack() -> MapStack:
+        cells = 60
+        # Rows index y and columns index x, both from a -5 m origin at 0.25 m.
+        # The occupied body sits 2.5-4.0 m straight ahead of the origin; the
+        # unknown patch sits alongside it at y = 3.25-4.5 m.
+        probability = np.full((cells, cells), 0.05)
+        probability[18:23, 30:36] = 0.95
+        probability[33:38, 20:28] = np.nan
+        variance = np.full((cells, cells), 0.005)
+        variance[33:38, 20:28] = np.nan
+
+        def grid(values: np.ndarray) -> LocalGridMap:
+            return LocalGridMap(values, -5.0, -5.0, 0.25)
+
+        return MapStack(
+            ground_obstacle_probability=grid(probability),
+            ground_occupancy_uncertainty=grid(variance),
+            ground_semantics=grid(np.full((cells, cells), 0.3)),
+            ground_semantic_obstacles=grid(np.full((cells, cells), 0.1)),
+            ground_semantic_uncertainty=grid(np.full((cells, cells), 0.005)),
+        )
+
+    @staticmethod
+    def _straight(length_m: float, steps: int = 60) -> np.ndarray:
+        x = np.linspace(0.0, length_m, steps)
+        zeros = np.zeros_like(x)
+        return np.stack([x, zeros, zeros, zeros, zeros], axis=-1)
+
+    def test_diagnostics_are_json_serialisable_scalars(self) -> None:
+        stack = self._stack()
+        path = self._straight(5.0)
+        population = np.stack([path, path + 0.1])
+        diagnostics = stack.uncertainty_diagnostics(
+            population, path, path, (0.0, 0.0), 1.0
+        )
+        for key, value in diagnostics.items():
+            with self.subTest(key=key):
+                self.assertTrue(
+                    value is None or isinstance(value, float),
+                    f"{key} is {type(value).__name__}, not a float",
+                )
+        # A numpy bool here silently killed a whole shadow run.
+        json.dumps(diagnostics)
+
+    def test_fixed_probe_keeps_reach_a_shrunken_path_loses(self) -> None:
+        """The point of the probe: a slowed vehicle still sees what is ahead."""
+        stack = self._stack()
+        crawling = self._straight(0.4)
+        probe = self._straight(8.0)
+        diagnostics = stack.uncertainty_diagnostics(
+            None, crawling, probe, (0.0, 0.0), 1.0
+        )
+        self.assertLess(diagnostics["path_extent_m"], 1.0)
+        self.assertGreater(diagnostics["probe_extent_m"], 7.0)
+        # The blocked patch sits about 2.5 m ahead of the origin.
+        self.assertEqual(diagnostics["path_occ_blocked_frac"], 0.0)
+        self.assertGreater(diagnostics["probe_occ_blocked_frac"], 0.0)
+
+    def test_unknown_evidence_separates_from_ambiguous_evidence(self) -> None:
+        stack = self._stack()
+        # y = +3.75 m crosses the NaN patch, which is unknown, not ambiguous.
+        unknown_path = self._straight(2.0)
+        unknown_path[:, 1] = 3.8
+        diagnostics = stack.uncertainty_diagnostics(
+            None, unknown_path, None, (0.0, 0.0), 1.0
+        )
+        self.assertGreater(diagnostics["path_occ_unknown_frac"], 0.5)
+        self.assertEqual(diagnostics["path_occ_ambiguous_frac"], 0.0)
+        self.assertGreaterEqual(
+            diagnostics["path_occ_exposure"], diagnostics["path_occ_unknown_frac"]
+        )
+
+    def test_missing_layers_report_none_rather_than_zero(self) -> None:
+        """A blank map must not look like confidently clear ground."""
+        diagnostics = MapStack().uncertainty_diagnostics(
+            None, self._straight(5.0), None, (0.0, 0.0), 1.0
+        )
+        self.assertIsNone(diagnostics["path_occ_exposure"])
+        self.assertIsNone(diagnostics["probe_occ_exposure"])
+        self.assertIsNone(diagnostics["here_occ_probability"])
 
 
 if __name__ == "__main__":

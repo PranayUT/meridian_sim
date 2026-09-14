@@ -22,7 +22,7 @@ All work described here is present in the working tree but is not committed.
 There were already related dirty changes when this calibration work began, so
 do not discard or reset the working tree wholesale.
 
-The current focused test command passes 27 tests:
+The current focused test command passes 43 tests:
 
 ```bash
 conda run --no-capture-output --name rugged-ugv \
@@ -646,76 +646,426 @@ but simulator physics is no longer silently unseeded.
 
 ### Current verification status
 
-The focused suite now passes 36 tests:
+The focused suite now passes 43 tests:
 
 ```bash
 conda run --no-capture-output --name rugged-ugv \
   python -m unittest discover -s autonomy -p 'test*.py'
 ```
 
-The current end-to-end run is `r11_uav_persistent_escape_full_rtf1`, Route 11
-forward, planner seed 7, Gazebo seed 4207, 1.0x RTF, threshold 0.75, and
-maturity 1.0 s. At simulator time 224 s it has made one retained semantic UAV
-request and needed two drags. This is an in-progress observation, not a final
-result. The ground-only `_v2` control completed with three drags.
+The first end-to-end run with retained products and overlap escape was
+`r11_uav_persistent_escape_full_rtf1`, Route 11 forward, planner seed 7,
+Gazebo seed 4207, 1.0x RTF, threshold 0.75, and maturity 1.0 s. It completed:
 
-The target for accepting this work is an assisted endpoint run with fewer than
-three drags under the paired configuration, followed by a fresh deterministic
-ground-only control on the same launcher and seeds.
+| Run | Outcome | Sim time | Driven | Drags | UAV requests |
+|---|---|---:|---:|---:|---:|
+| assisted `_v2` regression | success | 861 s | 848 m | 8 | 3 |
+| persistent fusion + escape | success | 645 s | 702 m | 4 | 6 |
 
-0. Separate the planner's tick budget from the comparison before running more
-   paired trials. At a 50%+ miss rate the assisted mode is being measured
-   partly on its own evaluation cost. Try `--assistance-period` above zero, or
-   profile `MapStack.cost`, and confirm the miss rate is comparable across
-   modes before attributing a drag difference to the aerial evidence.
-1. Repeat the `r11_cf_rtf1` / `r11_ground_rtf1` pair over several seeds. One
-   paired run cannot separate a 22% time saving from trajectory noise, and the
-   drag counts (7 against 3) are small enough that one extra wedge moves them.
-2. Repeat the successful 0.75 configuration over multiple vegetation/planner
-   seeds and Route 11 reverse. Do not promote a new simulator default based on
-   one stochastic forward run.
-3. Add periodic exposure and counterfactual viability metrics. Request history
-   records triggers only; it does not yet record near-misses.
-4. Request count is now set by the counterfactual viability thresholds, not by
-   exposure: every `r11_cf_rtf1` request was admitted below the 0.75 gate.
-   Raising the exposure threshold further cannot reduce the count. Increase
-   cell maturity conservatively (for example 1.5 or 2.0 s) first, and only then
-   consider the viability thresholds. Keep one variable fixed per comparison.
-5. Add periodic shadow diagnostics containing per-source mature exposure,
-   missing-cell fraction, ambiguous-probability fraction, high-variance
-   fraction, and counterfactual baseline/free/occupied viability. Use a
-   ground-only shadow run to detect false negatives without UAV maps changing
-   the route.
-6. Validate safety, not only request count: known occluded or obstacle-
-   sensitive regions should still trigger, and reducing requests must not
-   increase collision/stuck behavior materially.
-7. Separately investigate why the drag-enabled Route 11 trials time out rather
-   than reach the final waypoint. Preserve the drag code; it is expected and
-   should remain enabled for these tests.
+This is a material improvement over the assisted regression: 216 fewer
+simulator seconds, 146 m less driving, and half as many drags. It is not yet an
+accepted result. Four drags does not beat the old three-drag ground-only
+control, and six requests misses the fewer-than-five request goal.
 
-## Recommended next command
+The old control is no longer an exact comparator because it predates the fixed
+Gazebo seed and bounded reverse-overlap behavior. A fresh ground-only run with
+the same launcher and code is required before attributing the remaining
+difference to assistance.
 
-Repeat the paired comparison on a second seed. Run both halves; a single
-assisted run has no control to be read against.
+The acceptance priority was clarified during this debugging pass. UAV request
+count is secondary; fewer than five is desirable but is not the main target.
+The assisted endpoint run must beat a fresh paired ground-only run on all three
+operational metrics:
 
-```bash
-for MODE in counterfactual_uav ground_only; do
-  ./scripts/run_experiment.sh \
-    --run-id "r11_${MODE}_s8_rtf1" \
-    --rtf 1 \
-    --routes Route-11 \
-    --directions forward \
-    --cycles 1 \
-    --seed 8 \
-    --assistance "${MODE}" \
-    --uav-uncertainty-threshold 0.75 \
-    --mapping-uncertainty-maturity 1.0
-done
+1. less simulator time;
+2. less distance driven;
+3. fewer drag interventions.
+
+Do not trade any of those three for a lower request count.
+
+### Fresh paired result after retained fusion and overlap escape
+
+The exact ground-only control is `r11_ground_persistent_escape_rtf1`. It uses
+the same code, planner seed 7, Gazebo seed 4207, 1.0x RTF, route direction, and
+drag harness as `r11_uav_persistent_escape_full_rtf1`.
+
+| Metric | `counterfactual_uav` | `ground_only` | Assisted delta |
+|---|---:|---:|---:|
+| Outcome | success | success | — |
+| Simulator time | 645 s | **539 s** | +106 s (+20%) |
+| Distance driven | 702 m | **631 m** | +71 m (+11%) |
+| Drags | 4 | 4 | 0 |
+| UAV requests | 6 | 0 | +6 |
+
+This pair fails all three operational acceptance criteria: assistance is
+slower, drives farther, and does not reduce drags. It does show that the
+infrastructure fixes improved the assisted mode relative to its own `_v2`
+regression (8 drags to 4), but that is not sufficient.
+
+The drag geography also changed rather than disappearing. Both modes wedged in
+the first dense corridor and each finished with four interventions. The
+remaining leading hypothesis is over-constrained semantic fusion: a semantic
+request paints the full labeled bush/tree canopy, the planner treats that
+raster as hard collision, and the new soft clearance ring expands its routing
+influence further. This can add detour distance without removing contact with
+the smaller physical bodies. The next comparison must separate semantic
+traversability cost from physical occupancy collision/clearance.
+
+### Semantic canopy is no longer physical collision
+
+The product-separation hypothesis was confirmed in code: although
+`semantic_traversability` and `canopy_obstacle` were requested separately,
+`MapStack.cost` recombined both products' `obstacle` rasters and applied the
+same physical collision threshold. A semantic tree or bush therefore regained
+hard-collision authority over its full labeled canopy.
+
+Planner fusion now uses:
+
+- semantic UAV `cost` as traversability cost only;
+- occupancy UAV `obstacle` as physical hard collision;
+- occupancy UAV clearance as the only aerial body-clearance field.
+
+Semantic ground cost and semantic obstacle probability are still superseded
+inside semantic aerial coverage. The change therefore removes an incorrect
+hard constraint rather than stacking aerial cost on top of the old ground
+collision. Ground-only does not execute this path, so
+`r11_ground_persistent_escape_rtf1` remains the exact control for the next
+assisted run.
+
+The first headless product-split run, `r11_uav_product_split_rtf1`, was stopped
+at simulator time 142 s to switch to visual diagnosis. It had driven 140 m,
+made three UAV requests, and needed one drag. It is an interrupted run and is
+not an endpoint comparison.
+
+The active visual diagnostic is `r11_uav_product_split_gui`, with the same
+Route 11 forward, planner seed 7, Gazebo seed 4207, 1.0x RTF, threshold 0.75,
+and maturity 1.0 s configuration. It was launched with `--gui` and the chase
+camera so contact, stopping, detour, and post-fusion behavior can be inspected
+directly. Its result must not be treated as final until `campaign.csv` records
+endpoint success.
+
+That GUI diagnostic was stopped at simulator time 602 s after six drags and
+ten UAV requests. All ten requests were `mobility_relevant`; neither the
+population exposure threshold nor the occupancy counterfactual predicted the
+failures before loss of motion. This directly confirms a disconnect between
+the original uncertainty population and the drag condition.
+
+### Selected-trajectory trigger
+
+The population evaluator pools distinct swept cells from all 192 sampled
+rollouts. That is appropriate for comparing control alternatives, but it can
+dilute uncertainty on the one trajectory MPPI actually selects and can center
+an ROI on rejected controls. The mobility fallback then reused that unrelated
+ROI after contact.
+
+A second, independent evaluator now measures only `MPPI.best_trajectory()`.
+It uses independent per-cell maturity state and raises
+`selected_trajectory` when at least 20% of the selected swept footprint remains
+uncertain. The original 0.75 population threshold and counterfactual remain in
+place. If selected-path evidence does not cross 20%, the normal policy keeps
+priority.
+
+The mobility fallback is now permitted only when both conditions hold:
+
+1. world-pose displacement has stayed below 0.25 m for five seconds; and
+2. the selected trajectory still has a nonempty uncertain ROI.
+
+It can no longer attach a physical stall to uncertainty found only on rejected
+rollouts. A focused test verifies that uncertainty on the selected path
+triggers while the same uncertainty on another rollout does not.
+
+Request and trigger histories now record simulator time and vehicle position.
+The harness writes `intervention_history.json` with simulator time, stuck
+position, drag target, route progress, and path length. These make temporal and
+spatial trigger/drag correlation measurable instead of inferred from console
+line order.
+
+The next experiment is a ground-only shadow run. It evaluates and records the
+same trigger policy but does not request or fuse a UAV map, so trigger lead
+time can be compared with drag events without the planner trajectory changing
+under assistance.
+
+The first shadow, `r11_ground_trigger_shadow_rtf1`, was stopped after its first
+drag. The rover became stuck near `(20.65, 6.64)` and was dragged at simulator
+time 121.83 s. The first trigger was at 98.63 s at `(20.64, 6.65)`, a 23.20 s
+lead relative to the harness intervention, but it was `mobility`, not
+`selected_trajectory`. In other words, the trigger occurred at the correct
+place only after world displacement had already stopped.
+
+The cause was applying one-second per-cell maturity to a moving three-second
+selected trajectory. Upcoming cells continually enter and leave that short
+horizon, so the selected-path gate inherited the same moving-frontier failure
+it was intended to avoid. The selected path now uses immediate cell
+uncertainty and retains the existing two-second source persistence. Population
+exposure and its counterfactual keep the original per-cell maturity behavior.
+
+`assistance_trace.jsonl` is now written every 0.5 simulator seconds with
+population exposure, selected-path exposure, command speed, wheel speed,
+world-mobility duration, trigger relevance, assistance state, position, and
+retained-product count. A corrected shadow must show a
+`selected_trajectory` episode before `mobility_stalled` becomes true at the
+first failure location.
+
+### The first corrected shadow never ran
+
+`r11_ground_action_shadow_rtf1` exited 0.89 simulator seconds in:
+
+```text
+TypeError: Object of type bool is not JSON serializable
 ```
 
-The two halves may run concurrently; each takes its own `GZ_PARTITION` from its
-run ID. On a 12-core machine the pair used about 3 cores total, so the
-concurrency did not itself cause the missed control cycles.
+`decision_relevant` is built as `np.any(uncertain) and ...`. Python's `and`
+returns its first falsy operand, so on the common path the value was
+`np.bool_(False)`, which is not a `bool` and not serializable. Requests had
+never hit it because a request only happens when the expression is true, and
+then `and` returns the last operand, a real `bool`. Adding a trace line that
+records the value on every cycle exposed it immediately. The value is now
+coerced at its source, and a test asserts that every diagnostic field is a
+`float` or `None`.
+
+## Measuring which uncertainty variable actually predicts a drag
+
+Rather than test one trigger hypothesis per run, the trace now records a broad
+set of candidate stuck-predictors at 2 Hz and the correlation is done offline
+against the drag times in `intervention_history.json`. There are 78 fields per
+sample. The uncertainty, hazard, and extent variables are each measured over
+three geometries:
+
+| Geometry | Prefix | What it is |
+|---|---|---|
+| Population | `pop_` | the sampled rollouts, which is what the Meridian exposure policy consumes |
+| Selected path | `path_` | the trajectory the controller chose, a fixed 3 s horizon |
+| Forward probe | `probe_` | a fixed 8 m corridor along the intended steering |
+
+The probe exists because the other two are fixed-*time* geometries. The
+selected path reaches about 5 m at target speed but collapses below 1 m as the
+controller slows, which is exactly when a warning is wanted, so its reach is
+smallest at the moment of maximum risk. The probe replays the nominal steering
+at target speed for as many steps as 8 m needs, so its warning distance is
+constant. `--assistance-probe-m` sets it.
+
+Per geometry: occupancy exposure split into its three causes separately
+(`_occ_unknown_frac`, `_occ_ambiguous_frac`, `_occ_variance_frac`), obstacle
+probability max/mean, blocked fraction, the semantic equivalents, fused
+planner cost, and path extent. Alongside those: the counterfactual's own
+internals (`cf_baseline_viability`, `cf_free_viability`,
+`cf_occupied_viability`), what the maps say about the cells the vehicle is
+standing on (`here_*`), planner cost spread, and wheel-versus-world slip.
+
+Slip is included because wheel odometry stays high while the rover spins its
+wheels against vegetation; the gap between wheel speed and world displacement
+is a direct physical precursor to a wedge that no uncertainty channel sees.
+
+`tools/analyze_stuck_correlation.py` joins the trace to the interventions and
+scores every variable by AUC in three windows:
+
+- `approach`, the 15 s before the stuck timer started. Only separation **here**
+  can warn early enough to act on.
+- `stalled`, the stuck timer running. Separation only here means the variable
+  is a detector, not a predictor.
+- `drag`, around the intervention itself.
+
+It also reports the median lead time of the first sustained threshold crossing
+before each drag, and how often the same crossing fires during ordinary
+driving, because a variable that alarms constantly explains nothing however
+well it separates.
+
+## Retained UAV products made every planner tick cost more
+
+Profiling the instrumentation found a larger pre-existing problem. Retaining
+UAV products across channels and route regions was correct for evidence, but
+`_sample_aerial` rasterised the full query against *every* retained product on
+every call, and it was called from `MapStack.cost` and from both evaluators.
+The per-tick cost therefore grew linearly with how much of the route had been
+answered.
+
+Measured on a 192 x 60 rollout population, products spread along the route:
+
+| Retained products | `MapStack.cost` | `evaluate_assistance` |
+|---:|---:|---:|
+| 0 | 3.2 ms | 21.8 ms |
+| 3 | 14.0 ms | 39.8 ms |
+| 6 | 24.0 ms | 55.6 ms |
+
+At six products `evaluate_assistance` alone exceeded the whole 50 ms tick
+budget before the planner did any work. This is consistent with the first
+attempt at these correlation runs, where the assisted half sat at 89-95% missed
+cycles against 14-17% for ground-only.
+
+`_sample_aerial` now rejects a product whose bounding box does not intersect
+the query before sampling it, samples all four layers in one index pass instead
+of two, and stops once every query point has an answer. After the fix:
+
+| Retained products | `MapStack.cost` | `evaluate_assistance` |
+|---:|---:|---:|
+| 0 | 3.2 ms | 21.8 ms |
+| 6 | 6.4 ms | 26.0 ms |
+| 10 | 6.6 ms | 21.3 ms |
+
+A test pins the new loop cell-for-cell against the original one over six
+overlapping products and 500 random query points, in both map types.
+
+The diagnostics themselves were also cut from 15.3 ms to 3.4 ms by subsampling
+the rollout population to 24 trajectories and not recomputing fused planner
+cost over the population, which `evaluate_assistance` already covers.
+
+This fix is necessary but was not sufficient. See the assisted run below.
+
+## Correlation runs: `r11_corr_ground_rtf1` and `r11_corr_uav_rtf1`
+
+Route 11 forward, planner seed 7, Gazebo seed 4207, 1.0x RTF, threshold 0.75,
+maturity 1.0 s, path threshold 0.20, probe 8 m, drag harness enabled. The only
+difference between them is `--assistance`. Both were interrupted at about 260
+simulator seconds and have empty `campaign.csv` files, so neither is an endpoint
+comparison. The ground trace contains 493 samples and three interventions; the
+assisted trace contains 486 samples, two interventions, and eleven retained UAV
+products. They are useful only for selecting a candidate predictor.
+
+### The selected-trajectory channel has no specificity at 0.20
+
+The assisted half made seven requests in the first 149 simulator seconds, then
+four more before it was stopped at 260 s:
+
+```text
+ #  source                exposure  sim_time_s
+ 1  ground_semantic_cost     0.250       5.6
+ 2  ground_semantic_cost     0.463      20.4
+ 3  ground_semantic_cost     0.338      37.7
+ 4  ground_semantic_cost     0.319      65.4
+ 5  ground_semantic_cost     0.317      93.3
+ 6  lidar_occupancy          0.580     115.9
+ 7  ground_semantic_cost     0.433     148.8
+```
+
+Every one was `action_relevant`. None was `decision_relevant`, none was
+`mobility_relevant`. Eleven requests in 260 s is already incompatible with the
+fewer-than-five target; no extrapolation is needed.
+
+So the `selected_trajectory` gate did not fix the alignment problem, it
+inverted it. The mobility fallback fired only after the rover had already
+stopped; the action gate at a 20% threshold fires more or less continuously on
+open ground, because a moving three-second horizon always has a frontier in it.
+Neither is aligned with the drag condition. The first is too late and the
+second is not selective at all.
+
+That also explains why the assisted run sat at 93-95% missed cycles even after
+the `_sample_aerial` fix: it accumulated seven retained products in 149 s, and
+consecutive requests along the route overlap, so bounding-box rejection has
+less to reject. The request rate is the root cause, not the sampling cost.
+
+The ground-only half stayed at 11-19% missed cycles throughout, so the
+instrumentation itself is affordable.
+
+### Partial correlation result
+
+The ground-only trace recorded three interventions in three spatially distinct
+regions. The corrected offline ranking is:
+
+```text
+variable                    approach AUC  threshold  prestall  early  baseline active
+probe_occ_exposure                 0.853      0.049      7.4 s    3/3             0.6%
+probe_occ_unknown_frac             0.819      0.002      9.9 s    3/3             1.2%
+probe_occ_probability_mean         0.859      0.179     -1.1 s    1/3             3.1%
+pop_occ_exposure                   0.824      0.044      4.2 s    3/3             3.1%
+```
+
+`prestall` is measured relative to the beginning of the harness's 30 s stuck
+timer; positive values are genuine warnings, negative values are detectors.
+The cleanest interpretation is therefore **uncertain occupancy in the fixed
+8 m forward probe**. Obstacle probability has a high AUC but crosses too late.
+Semantic uncertainty does not transfer consistently across the traces and is
+not the candidate channel for these wedges.
+
+The candidate threshold was then treated as fixed and checked on an independent
+ground-only retry, `r11_corr_ground_full_rtf1_retry`. That retry was stopped on
+request at simulator time 441 s, so it is also partial. It contains three drag
+interventions but only two local map opportunities: the first two stuck poses
+are 7 m apart and should be covered by one 25 m UAV product. Against those two
+regions, the fixed `probe_occ_exposure > 0.04895` threshold, sustained for two
+trace samples, produced:
+
+| Drag region | Stuck position | First warning position | Before intervention | Before stall |
+|---|---|---|---:|---:|
+| dense outbound corridor | `(25.91, 23.34)` | `(29.15, 14.24)` | 36.11 s | 6.11 s |
+| return corridor | `(11.28, 68.64)` | `(9.35, 70.47)` | 32.77 s | 2.77 s |
+
+The warnings occurred 9.66 m and 2.66 m from the eventual stuck poses, both
+inside the useful scale of a 25 m local product. The fixed threshold was active
+for 3.7% of ordinary samples in the retry and began 1.94 false-alarm episodes
+per minute. That specificity is not yet good enough to promote directly to a
+request policy, but it is a much better starting point than the continuously
+firing selected-path semantic gate.
+
+For comparison, the fixed `probe_occ_probability_mean > 0.1791` threshold did
+not warn either region before loss of progress. It fired in only one region,
+3.89 s after the stall began. Probability is a contact detector here; occupancy
+uncertainty is the channel with prospective value.
+
+### Corrections to the analysis tool
+
+`tools/analyze_stuck_correlation.py` now:
+
+- uses the low tail for variables that predict a drag by falling, such as
+  counterfactual viability, instead of ranking them and then testing the wrong
+  direction;
+- uses a strict threshold so a zero-valued 95th percentile does not alarm on
+  every ordinary zero;
+- counts contiguous false-alarm episodes rather than every overlapping pair of
+  samples in one plateau;
+- reports lead relative to both the intervention and the start of the stall;
+- groups interventions within 12.5 m into one map opportunity by default;
+- adds uncertainty-times-hazard and uncertainty-times-cost diagnostics to test
+  whether uncertainty is colocated with a planner constraint.
+
+Run the analysis with:
+
+```bash
+conda run --no-capture-output --name rugged-ugv \
+  python tools/analyze_stuck_correlation.py \
+  runtime/experiments/r11_corr_ground_rtf1 --top 20 --timeline 4
+```
+
+### Timing fix pulled after these traces
+
+Commit `88ceb86` was pulled before committing this work. It makes the assistance
+state machine use simulator time and adds optional lockstep physics, in which
+the controller explicitly advances one 50 ms control period at a time. Every
+correlation trace above predates that commit and was free-running. The spatial
+finding is still useful, but its exact AUC, lead time, and threshold must be
+validated under lockstep before they drive live requests.
+
+### Next validation
+
+1. Complete a lockstep ground-only shadow over Route 11 for seeds 7 and 8. Do
+   not fuse UAV data yet; preserve the control trajectory while validating the
+   candidate.
+2. Start with `probe_occ_exposure > 0.04895`, require at least two consecutive
+   samples, and report drag-region recall, lead before the stall, baseline
+   active fraction, and false-alarm episodes per minute. The threshold is a
+   measured candidate, not a new default.
+3. Reduce the roughly two false episodes per minute before enabling requests.
+   Longer persistence or an occupancy-specific planner-pressure condition is
+   preferable to mixing semantic uncertainty back in.
+4. If the predictor survives, use its uncertain probe cells to center a
+   `lidar_occupancy` request. Then compare assisted and ground-only lockstep runs
+   on endpoint success, simulator time, distance, and drag regions. Request
+   count remains secondary to progress and intervention reduction.
+
+The next shadow command should include `--lockstep`:
+
+```bash
+./scripts/run_experiment.sh \
+  --run-id r11_corr_ground_lockstep_s7 \
+  --rtf 1 \
+  --routes Route-11 \
+  --directions forward \
+  --cycles 1 \
+  --seed 7 \
+  --assistance ground_only \
+  --lockstep \
+  --uav-uncertainty-threshold 0.75 \
+  --mapping-uncertainty-maturity 1.0
+```
 
 ## Defaults and cautions
 
